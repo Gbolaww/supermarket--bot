@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/lib/pq"
 )
 
 // --- Data Models ---
@@ -57,22 +57,31 @@ var db *sql.DB
 // --- Database setup ---
 
 func initDB() {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		log.Fatal("DATABASE_URL environment variable is not set")
+	}
+
 	var err error
-	db, err = sql.Open("sqlite3", "./orders.db")
+	db, err = sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal("Failed to open database:", err)
 	}
 
+	if err = db.Ping(); err != nil {
+		log.Fatal("Failed to connect to database:", err)
+	}
+
 	createTable := `
 	CREATE TABLE IF NOT EXISTS orders (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id SERIAL PRIMARY KEY,
 		order_id TEXT NOT NULL,
 		phone TEXT NOT NULL,
 		items TEXT NOT NULL,
 		total REAL NOT NULL,
 		pickup_slot TEXT NOT NULL,
 		status TEXT DEFAULT 'pending',
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);`
 
 	_, err = db.Exec(createTable)
@@ -86,7 +95,6 @@ func initDB() {
 func saveOrder(phone string, cart []CartItem, pickup string, total float64) (string, error) {
 	orderID := fmt.Sprintf("ORD-%d", time.Now().UnixMilli())
 
-	// Build items summary string
 	var itemParts []string
 	for _, item := range cart {
 		itemParts = append(itemParts, fmt.Sprintf("%s x%d", item.Product.Name, item.Quantity))
@@ -94,7 +102,7 @@ func saveOrder(phone string, cart []CartItem, pickup string, total float64) (str
 	itemsStr := strings.Join(itemParts, ", ")
 
 	_, err := db.Exec(
-		`INSERT INTO orders (order_id, phone, items, total, pickup_slot) VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO orders (order_id, phone, items, total, pickup_slot) VALUES ($1, $2, $3, $4, $5)`,
 		orderID, phone, itemsStr, total, pickup,
 	)
 	if err != nil {
@@ -194,13 +202,11 @@ func handleMessage(from, message string) string {
 
 	case "CONFIRM":
 		if message == "yes" || message == "confirm" {
-			// Calculate total
 			total := 0.0
 			for _, item := range session.Cart {
 				total += item.Product.Price * float64(item.Quantity)
 			}
 
-			// Save to database
 			orderID, err := saveOrder(from, session.Cart, session.Pickup, total)
 			if err != nil {
 				log.Printf("Error saving order: %v", err)
@@ -373,7 +379,6 @@ func main() {
 	defer db.Close()
 
 	port := os.Getenv("PORT")
-	log.Printf("🔍 PORT environment variable: '%s'", port)
 	if port == "" {
 		port = "8080"
 	}

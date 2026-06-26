@@ -7,6 +7,6 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=1 go build -o main .
+RUN go build -o main .
 
 CMD ["./main"]
