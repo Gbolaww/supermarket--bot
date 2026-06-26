@@ -101,7 +101,6 @@ func generateOrderID() string {
 	for i := range id {
 		id[i] = chars[rand.Intn(len(chars))]
 	}
-	// Make sure it's unique
 	var count int
 	db.QueryRow(`SELECT COUNT(*) FROM orders WHERE order_id = $1`, string(id)).Scan(&count)
 	if count > 0 {
@@ -150,6 +149,86 @@ func saveOrder(phone string, cart []CartItem, pickup string, total float64) (str
 	return orderID, nil
 }
 
+// --- Auth middleware ---
+
+func requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Check session cookie
+		cookie, err := r.Cookie("admin_session")
+		if err == nil && cookie.Value == os.Getenv("ADMIN_PASSWORD") {
+			next(w, r)
+			return
+		}
+
+		// Show login page
+		if r.Method == http.MethodPost {
+			r.ParseForm()
+			password := r.FormValue("password")
+			if password == os.Getenv("ADMIN_PASSWORD") {
+				http.SetCookie(w, &http.Cookie{
+					Name:     "admin_session",
+					Value:    password,
+					Path:     "/",
+					MaxAge:   86400 * 7, // 7 days
+					HttpOnly: true,
+				})
+				http.Redirect(w, r, r.URL.Path, http.StatusSeeOther)
+				return
+			}
+			// Wrong password
+			showLoginPage(w, "❌ Wrong password. Try again.")
+			return
+		}
+
+		showLoginPage(w, "")
+	}
+}
+
+func showLoginPage(w http.ResponseWriter, errMsg string) {
+	shopName := os.Getenv("SHOP_NAME")
+	if shopName == "" {
+		shopName = "Supermarket"
+	}
+
+	errHTML := ""
+	if errMsg != "" {
+		errHTML = fmt.Sprintf(`<div class="error">%s</div>`, errMsg)
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head>
+	<title>%s Admin Login</title>
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<style>
+		* { box-sizing: border-box; margin: 0; padding: 0; }
+		body { font-family: Arial, sans-serif; background: #f5f5f5; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+		.login-card { background: white; border-radius: 12px; padding: 32px; width: 100%%; max-width: 380px; margin: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+		.logo { text-align: center; font-size: 40px; margin-bottom: 10px; }
+		h1 { text-align: center; color: #333; font-size: 20px; margin-bottom: 6px; }
+		p { text-align: center; color: #888; font-size: 14px; margin-bottom: 24px; }
+		input[type=password] { width: 100%%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 15px; margin-bottom: 14px; }
+		button { width: 100%%; padding: 12px; background: #4CAF50; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; }
+		button:hover { background: #45a049; }
+		.error { background: #ffe0e0; color: #c00; padding: 10px; border-radius: 6px; margin-bottom: 14px; text-align: center; font-size: 14px; }
+	</style>
+</head>
+<body>
+	<div class="login-card">
+		<div class="logo">🛒</div>
+		<h1>%s</h1>
+		<p>Admin Dashboard</p>
+		%s
+		<form method="POST">
+			<input type="password" name="password" placeholder="Enter admin password" required autofocus>
+			<button type="submit">Login</button>
+		</form>
+	</div>
+</body>
+</html>`, shopName, shopName, errHTML)
+}
+
 // --- Twilio sender ---
 
 func sendWhatsAppMessage(to, body string) error {
@@ -187,6 +266,11 @@ func sendWhatsAppMessage(to, body string) error {
 // --- Bot logic ---
 
 func handleMessage(from, message string) string {
+	shopName := os.Getenv("SHOP_NAME")
+	if shopName == "" {
+		shopName = "our store"
+	}
+
 	message = strings.TrimSpace(strings.ToLower(message))
 
 	session, exists := sessions[from]
@@ -203,7 +287,7 @@ func handleMessage(from, message string) string {
 		if err != nil || len(products) == 0 {
 			return "Sorry, our catalog is currently unavailable. Please try again later."
 		}
-		return buildCatalogMessage(products)
+		return fmt.Sprintf("👋 Welcome to *%s*!\n\n%s", shopName, buildCatalogMessage(products))
 
 	case "BROWSING":
 		products, _ := getProducts()
@@ -312,9 +396,14 @@ func buildOrderSummary(s *Session) string {
 	return sb.String()
 }
 
-// --- Shared HTML helpers ---
+// --- Shared HTML header ---
 
 func adminHeader(w http.ResponseWriter, activeTab string) {
+	shopName := os.Getenv("SHOP_NAME")
+	if shopName == "" {
+		shopName = "Supermarket"
+	}
+
 	productsActive := ""
 	ordersActive := ""
 	if activeTab == "products" {
@@ -326,13 +415,14 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 	fmt.Fprintf(w, `<!DOCTYPE html>
 <html>
 <head>
-	<title>Supermarket Admin</title>
+	<title>%s Admin</title>
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<style>
 		* { box-sizing: border-box; margin: 0; padding: 0; }
 		body { font-family: Arial, sans-serif; background: #f5f5f5; font-size: 15px; }
-		.header { background: #4CAF50; color: white; padding: 16px; }
+		.header { background: #4CAF50; color: white; padding: 16px; display: flex; justify-content: space-between; align-items: center; }
 		.header h1 { font-size: 20px; }
+		.logout { color: white; font-size: 13px; text-decoration: none; background: rgba(0,0,0,0.2); padding: 6px 12px; border-radius: 6px; }
 		.tabs { display: flex; gap: 8px; padding: 16px; background: white; border-bottom: 1px solid #eee; }
 		.tab { flex: 1; text-align: center; padding: 10px; background: #f5f5f5; border: 2px solid #4CAF50; border-radius: 6px; color: #4CAF50; font-weight: bold; text-decoration: none; font-size: 14px; }
 		.tab.active { background: #4CAF50; color: white; }
@@ -346,7 +436,6 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 		@media(min-width: 600px) { .btn { width: auto; } }
 		.btn-green { background: #4CAF50; color: white; }
 		.btn-red { background: #f44336; color: white; }
-		.btn-blue { background: #2196F3; color: white; }
 		.product-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #eee; gap: 10px; }
 		.product-item:last-child { border-bottom: none; }
 		.product-info { flex: 1; }
@@ -367,12 +456,15 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 	</style>
 </head>
 <body>
-	<div class="header"><h1>🛒 Supermarket Admin</h1></div>
+	<div class="header">
+		<h1>🛒 %s</h1>
+		<a href="/admin/logout" class="logout">Logout</a>
+	</div>
 	<div class="tabs">
 		<a href="/admin" class="tab %s">📦 Products</a>
 		<a href="/admin/orders" class="tab %s">🧾 Orders</a>
 	</div>
-	<div class="container">`, productsActive, ordersActive)
+	<div class="container">`, shopName, shopName, productsActive, ordersActive)
 }
 
 // --- Webhook handler ---
@@ -564,6 +656,18 @@ func selected(current, value string) string {
 	return ""
 }
 
+// --- Logout handler ---
+
+func logoutHandler(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:   "admin_session",
+		Value:  "",
+		Path:   "/",
+		MaxAge: -1,
+	})
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
 // --- Entry point ---
 
 func main() {
@@ -576,8 +680,9 @@ func main() {
 	}
 
 	http.HandleFunc("/webhook", webhookHandler)
-	http.HandleFunc("/admin", adminHandler)
-	http.HandleFunc("/admin/orders", adminOrdersHandler)
+	http.HandleFunc("/admin", requireAuth(adminHandler))
+	http.HandleFunc("/admin/orders", requireAuth(adminOrdersHandler))
+	http.HandleFunc("/admin/logout", logoutHandler)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("OK"))
 	})
