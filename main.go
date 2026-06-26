@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -58,9 +59,24 @@ var db *sql.DB
 
 func initDB() {
 	var err error
-	db, err = sql.Open("sqlite3", "./orders.db")
+	
+	// Try to open with timeout
+	db, err = sql.Open("sqlite3", "file:./orders.db?cache=shared&mode=rwc&_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		log.Fatal("Failed to open database:", err)
+	}
+
+	// Set connection pool settings
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+
+	// Test connection with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	if err := db.PingContext(ctx); err != nil {
+		log.Fatal("Failed to ping database:", err)
 	}
 
 	createTable := `
@@ -389,3 +405,4 @@ func main() {
 	log.Printf("📊 Admin dashboard at http://localhost:%s/admin", port)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
+
