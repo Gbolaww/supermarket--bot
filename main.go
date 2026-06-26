@@ -383,7 +383,8 @@ func main() {
 		w.Write([]byte("OK"))
 	})
 
-	log.Printf("🚀 Bot server running on port %s", port)
+	addr := "0.0.0.0:" + port
+	log.Printf("🚀 Bot server running on %s", addr)
 	log.Printf("📊 Admin dashboard at http://localhost:%s/admin", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	log.Fatal(http.ListenAndServe(addr, nil))
 }
