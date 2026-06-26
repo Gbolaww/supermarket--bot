@@ -149,84 +149,24 @@ func saveOrder(phone string, cart []CartItem, pickup string, total float64) (str
 	return orderID, nil
 }
 
-// --- Auth middleware ---
-
-func requireAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Check session cookie
-		cookie, err := r.Cookie("admin_session")
-		if err == nil && cookie.Value == os.Getenv("ADMIN_PASSWORD") {
-			next(w, r)
-			return
-		}
-
-		// Show login page
-		if r.Method == http.MethodPost {
-			r.ParseForm()
-			password := r.FormValue("password")
-			if password == os.Getenv("ADMIN_PASSWORD") {
-				http.SetCookie(w, &http.Cookie{
-					Name:     "admin_session",
-					Value:    password,
-					Path:     "/",
-					MaxAge:   86400 * 7, // 7 days
-					HttpOnly: true,
-				})
-				http.Redirect(w, r, r.URL.Path, http.StatusSeeOther)
-				return
-			}
-			// Wrong password
-			showLoginPage(w, "❌ Wrong password. Try again.")
-			return
-		}
-
-		showLoginPage(w, "")
+func getOrdersByPhone(phone string) ([]string, error) {
+	rows, err := db.Query(
+		`SELECT order_id, items, total, pickup_slot, status, created_at FROM orders WHERE phone = $1 ORDER BY created_at DESC LIMIT 5`,
+		phone,
+	)
+	if err != nil {
+		return nil, err
 	}
-}
+	defer rows.Close()
 
-func showLoginPage(w http.ResponseWriter, errMsg string) {
-	shopName := os.Getenv("SHOP_NAME")
-	if shopName == "" {
-		shopName = "Supermarket"
+	var lines []string
+	for rows.Next() {
+		var orderID, items, pickupSlot, status, createdAt string
+		var total float64
+		rows.Scan(&orderID, &items, &total, &pickupSlot, &status, &createdAt)
+		lines = append(lines, fmt.Sprintf("• *%s* — %s\n  ₦%.0f | %s | _%s_", orderID, items, total, pickupSlot, status))
 	}
-
-	errHTML := ""
-	if errMsg != "" {
-		errHTML = fmt.Sprintf(`<div class="error">%s</div>`, errMsg)
-	}
-
-	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprintf(w, `<!DOCTYPE html>
-<html>
-<head>
-	<title>%s Admin Login</title>
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<style>
-		* { box-sizing: border-box; margin: 0; padding: 0; }
-		body { font-family: Arial, sans-serif; background: #f5f5f5; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
-		.login-card { background: white; border-radius: 12px; padding: 32px; width: 100%%; max-width: 380px; margin: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-		.logo { text-align: center; font-size: 40px; margin-bottom: 10px; }
-		h1 { text-align: center; color: #333; font-size: 20px; margin-bottom: 6px; }
-		p { text-align: center; color: #888; font-size: 14px; margin-bottom: 24px; }
-		input[type=password] { width: 100%%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 15px; margin-bottom: 14px; }
-		button { width: 100%%; padding: 12px; background: #4CAF50; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; }
-		button:hover { background: #45a049; }
-		.error { background: #ffe0e0; color: #c00; padding: 10px; border-radius: 6px; margin-bottom: 14px; text-align: center; font-size: 14px; }
-	</style>
-</head>
-<body>
-	<div class="login-card">
-		<div class="logo">🛒</div>
-		<h1>%s</h1>
-		<p>Admin Dashboard</p>
-		%s
-		<form method="POST">
-			<input type="password" name="password" placeholder="Enter admin password" required autofocus>
-			<button type="submit">Login</button>
-		</form>
-	</div>
-</body>
-</html>`, shopName, shopName, errHTML)
+	return lines, nil
 }
 
 // --- Twilio sender ---
@@ -263,6 +203,130 @@ func sendWhatsAppMessage(to, body string) error {
 	return nil
 }
 
+// --- Notification helpers ---
+
+func notifyAdmin(orderID, phone, items string, total float64, pickup string) {
+	adminPhone := os.Getenv("ADMIN_PHONE")
+	shopName := os.Getenv("SHOP_NAME")
+	if shopName == "" {
+		shopName = "Supermarket"
+	}
+	if adminPhone == "" {
+		return
+	}
+	msg := fmt.Sprintf(
+		"🔔 *New Order - %s*\n\nOrder ID: *%s*\nCustomer: %s\nItems: %s\nTotal: ₦%.0f\nPickup: %s\n\nUpdate status at: %s/admin/orders",
+		shopName, orderID, phone, items, total, pickup,
+		os.Getenv("RAILWAY_PUBLIC_DOMAIN"),
+	)
+	if err := sendWhatsAppMessage(adminPhone, msg); err != nil {
+		log.Printf("Failed to notify admin: %v", err)
+	}
+}
+
+func notifyCustomer(phone, orderID, status string) {
+	shopName := os.Getenv("SHOP_NAME")
+	if shopName == "" {
+		shopName = "Supermarket"
+	}
+
+	var msg string
+	switch status {
+	case "ready":
+		msg = fmt.Sprintf(
+			"✅ *Your order is ready!*\n\nHi! Your order *#%s* at %s is ready for pickup.\n\nPlease come collect your items. Thank you! 🛒",
+			orderID, shopName,
+		)
+	case "completed":
+		msg = fmt.Sprintf(
+			"🎉 *Order Completed!*\n\nYour order *#%s* has been marked as completed.\n\nThank you for shopping at %s! We hope to see you again soon. 😊",
+			orderID, shopName,
+		)
+	}
+
+	if msg != "" {
+		if err := sendWhatsAppMessage(phone, msg); err != nil {
+			log.Printf("Failed to notify customer: %v", err)
+		}
+	}
+}
+
+// --- Auth middleware ---
+
+func requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cookie, err := r.Cookie("admin_session")
+		if err == nil && cookie.Value == os.Getenv("ADMIN_PASSWORD") {
+			next(w, r)
+			return
+		}
+
+		if r.Method == http.MethodPost {
+			r.ParseForm()
+			password := r.FormValue("password")
+			if password == os.Getenv("ADMIN_PASSWORD") {
+				http.SetCookie(w, &http.Cookie{
+					Name:     "admin_session",
+					Value:    password,
+					Path:     "/",
+					MaxAge:   86400 * 7,
+					HttpOnly: true,
+				})
+				http.Redirect(w, r, r.URL.Path, http.StatusSeeOther)
+				return
+			}
+			showLoginPage(w, "❌ Wrong password. Try again.")
+			return
+		}
+
+		showLoginPage(w, "")
+	}
+}
+
+func showLoginPage(w http.ResponseWriter, errMsg string) {
+	shopName := os.Getenv("SHOP_NAME")
+	if shopName == "" {
+		shopName = "Supermarket"
+	}
+
+	errHTML := ""
+	if errMsg != "" {
+		errHTML = fmt.Sprintf(`<div class="error">%s</div>`, errMsg)
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head>
+	<title>%s Admin Login</title>
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<style>
+		* { box-sizing: border-box; margin: 0; padding: 0; }
+		body { font-family: Arial, sans-serif; background: #f5f5f5; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+		.login-card { background: white; border-radius: 12px; padding: 32px; width: 100%%; max-width: 380px; margin: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+		.logo { text-align: center; font-size: 40px; margin-bottom: 10px; }
+		h1 { text-align: center; color: #333; font-size: 20px; margin-bottom: 6px; }
+		p { text-align: center; color: #888; font-size: 14px; margin-bottom: 24px; }
+		input[type=password] { width: 100%%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 15px; margin-bottom: 14px; }
+		button { width: 100%%; padding: 12px; background: #4CAF50; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; }
+		.error { background: #ffe0e0; color: #c00; padding: 10px; border-radius: 6px; margin-bottom: 14px; text-align: center; font-size: 14px; }
+	</style>
+</head>
+<body>
+	<div class="login-card">
+		<div class="logo">🛒</div>
+		<h1>%s</h1>
+		<p>Admin Dashboard</p>
+		%s
+		<form method="POST">
+			<input type="password" name="password" placeholder="Enter admin password" required autofocus>
+			<button type="submit">Login</button>
+		</form>
+	</div>
+</body>
+</html>`, shopName, shopName, errHTML)
+}
+
 // --- Bot logic ---
 
 func handleMessage(from, message string) string {
@@ -272,6 +336,21 @@ func handleMessage(from, message string) string {
 	}
 
 	message = strings.TrimSpace(strings.ToLower(message))
+
+	// Order history command
+	if message == "orders" || message == "my orders" || message == "order history" {
+		orders, err := getOrdersByPhone(from)
+		if err != nil || len(orders) == 0 {
+			return "You have no past orders. Send *hi* to start ordering!"
+		}
+		var sb strings.Builder
+		sb.WriteString("📦 *Your Recent Orders:*\n\n")
+		for _, o := range orders {
+			sb.WriteString(o + "\n\n")
+		}
+		sb.WriteString("Send *hi* to place a new order.")
+		return sb.String()
+	}
 
 	session, exists := sessions[from]
 	if !exists || message == "hi" || message == "hello" || message == "start" {
@@ -331,9 +410,12 @@ func handleMessage(from, message string) string {
 	case "CONFIRM":
 		if message == "yes" || message == "confirm" {
 			total := 0.0
+			var itemParts []string
 			for _, item := range session.Cart {
 				total += item.Product.Price * float64(item.Quantity)
+				itemParts = append(itemParts, fmt.Sprintf("%s x%d", item.Product.Name, item.Quantity))
 			}
+			itemsStr := strings.Join(itemParts, ", ")
 
 			orderID, err := saveOrder(from, session.Cart, session.Pickup, total)
 			if err != nil {
@@ -341,9 +423,12 @@ func handleMessage(from, message string) string {
 				return "Sorry, there was an error saving your order. Please try again."
 			}
 
+			// Notify admin
+			go notifyAdmin(orderID, from, itemsStr, total, session.Pickup)
+
 			session.State = "DONE"
 			return fmt.Sprintf(
-				"🎉 Order confirmed!\n\nYour order ID is *%s*\nPickup time: *%s*\n\nWe'll have your items ready. See you soon!",
+				"🎉 *Order confirmed!*\n\nYour order ID is *%s*\nPickup time: *%s*\n\n📌 *Please save your order ID* — you'll need it to track your order.\n\nWe'll send you a message when your order is ready for pickup!\n\nType *orders* anytime to see your order history.",
 				orderID, session.Pickup,
 			)
 		} else if message == "no" || message == "cancel" {
@@ -353,7 +438,7 @@ func handleMessage(from, message string) string {
 		return "Please reply *yes* to confirm or *no* to cancel."
 
 	case "DONE":
-		return "Your order has been placed! Send *hi* to place a new order."
+		return "Your order has been placed! Send *hi* to place a new order or type *orders* to see your order history."
 	}
 
 	return "Send *hi* to start ordering."
@@ -535,7 +620,6 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 			</div>
 		</form>
 	</div>
-
 	<div class="card">
 		<h2>Products (%d)</h2>`, len(products))
 
@@ -566,9 +650,20 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		r.ParseForm()
-		id := r.FormValue("id")
-		status := r.FormValue("status")
-		db.Exec(`UPDATE orders SET status = $1 WHERE order_id = $2`, status, id)
+		orderID := r.FormValue("id")
+		newStatus := r.FormValue("status")
+
+		// Get customer phone before updating
+		var phone string
+		db.QueryRow(`SELECT phone FROM orders WHERE order_id = $1`, orderID).Scan(&phone)
+
+		db.Exec(`UPDATE orders SET status = $1 WHERE order_id = $2`, newStatus, orderID)
+
+		// Notify customer
+		if phone != "" {
+			go notifyCustomer(phone, orderID, newStatus)
+		}
+
 		http.Redirect(w, r, "/admin/orders", http.StatusSeeOther)
 		return
 	}
