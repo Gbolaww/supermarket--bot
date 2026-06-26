@@ -9,6 +9,4 @@ COPY . .
 
 RUN CGO_ENABLED=1 go build -o main .
 
-EXPOSE $PORT
-
 CMD ["./main"]
