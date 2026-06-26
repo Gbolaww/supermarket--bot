@@ -373,6 +373,7 @@ func main() {
 	defer db.Close()
 
 	port := os.Getenv("PORT")
+	log.Printf("🔍 PORT environment variable: '%s'", port)
 	if port == "" {
 		port = "8080"
 	}
