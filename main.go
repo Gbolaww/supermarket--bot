@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha512"
 	"database/sql"
@@ -108,14 +109,11 @@ func initDB() {
 		log.Fatal("Failed to create products table:", err)
 	}
 
-	// Add missing columns for existing databases
 	db.Exec(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_type TEXT DEFAULT 'pickup'`)
 	db.Exec(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_address TEXT DEFAULT ''`)
 	db.Exec(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'unpaid'`)
 	db.Exec(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS paystack_ref TEXT DEFAULT ''`)
 	db.Exec(`ALTER TABLE products ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'General'`)
-
-	// Update old orders that don't have payment_status
 	db.Exec(`UPDATE orders SET payment_status = 'paid', status = 'pending' WHERE payment_status IS NULL OR payment_status = ''`)
 
 	log.Println("✅ Database ready")
@@ -166,7 +164,6 @@ func getProducts() ([]Product, error) {
 		return nil, err
 	}
 	defer rows.Close()
-
 	var products []Product
 	for rows.Next() {
 		var p Product
@@ -182,7 +179,6 @@ func getAllProducts() ([]Product, error) {
 		return nil, err
 	}
 	defer rows.Close()
-
 	var products []Product
 	for rows.Next() {
 		var p Product
@@ -198,7 +194,6 @@ func getCategories() ([]string, error) {
 		return nil, err
 	}
 	defer rows.Close()
-
 	var categories []string
 	for rows.Next() {
 		var c string
@@ -214,7 +209,6 @@ func getProductsByCategory(category string) ([]Product, error) {
 		return nil, err
 	}
 	defer rows.Close()
-
 	var products []Product
 	for rows.Next() {
 		var p Product
@@ -234,13 +228,11 @@ func isReturningCustomer(phone string) bool {
 
 func saveOrder(phone string, session *Session, total float64) (string, error) {
 	orderID := generateOrderID()
-
 	var itemParts []string
 	for _, item := range session.Cart {
 		itemParts = append(itemParts, fmt.Sprintf("%s x%d", item.Product.Name, item.Quantity))
 	}
 	itemsStr := strings.Join(itemParts, ", ")
-
 	_, err := db.Exec(
 		`INSERT INTO orders (order_id, phone, items, total, delivery_type, delivery_address, pickup_slot, status, payment_status) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending_payment', 'unpaid')`,
 		orderID, phone, itemsStr, total, session.DeliveryType, session.DeliveryAddress, session.Pickup,
@@ -248,7 +240,6 @@ func saveOrder(phone string, session *Session, total float64) (string, error) {
 	if err != nil {
 		return "", err
 	}
-
 	return orderID, nil
 }
 
@@ -261,7 +252,6 @@ func getOrdersByPhone(phone string) ([]string, error) {
 		return nil, err
 	}
 	defer rows.Close()
-
 	var lines []string
 	for rows.Next() {
 		var orderID, items, deliveryType, pickupSlot, status, paymentStatus, createdAt string
@@ -290,69 +280,26 @@ func getOrderStatus(orderID string) (string, string, string, string, float64, er
 	return phone, items, status, paymentStatus, total, err
 }
 
-// --- Paystack helpers ---
+// --- Message sending ---
 
-func createPaystackPaymentLink(orderID, phone string, totalKobo int) (string, error) {
-	secretKey := os.Getenv("PAYSTACK_SECRET_KEY")
-
-	payload := map[string]interface{}{
-		"email":     phone + "@bot.com", // Paystack requires email
-		"amount":    totalKobo,
-		"reference": "ORDER-" + orderID + "-" + fmt.Sprintf("%d", time.Now().UnixMilli()),
-		"metadata": map[string]string{
-			"order_id": orderID,
-			"phone":    phone,
-		},
-		"callback_url": os.Getenv("RAILWAY_PUBLIC_DOMAIN") + "/paystack/callback",
-	}
-
-	payloadBytes, _ := json.Marshal(payload)
-
-	req, err := http.NewRequest("POST", "https://api.paystack.co/transaction/initialize", strings.NewReader(string(payloadBytes)))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+secretKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Status bool `json:"status"`
-		Data   struct {
-			AuthorizationURL string `json:"authorization_url"`
-			Reference        string `json:"reference"`
-		} `json:"data"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
-	}
-
-	if !result.Status {
-		return "", fmt.Errorf("paystack error")
-	}
-
-	// Save reference to order
-	db.Exec(`UPDATE orders SET paystack_ref = $1 WHERE order_id = $2`, result.Data.Reference, orderID)
-
-	return result.Data.AuthorizationURL, nil
+// Detect which provider to use based on env vars
+func useMetaAPI() bool {
+	return os.Getenv("META_ACCESS_TOKEN") != "" && os.Getenv("META_PHONE_NUMBER_ID") != ""
 }
 
-// --- Twilio sender ---
-
 func sendWhatsAppMessage(to, body string) error {
+	if useMetaAPI() {
+		return sendMetaMessage(to, body)
+	}
+	return sendTwilioMessage(to, body)
+}
+
+func sendTwilioMessage(to, body string) error {
 	accountSID := os.Getenv("TWILIO_ACCOUNT_SID")
 	authToken := os.Getenv("TWILIO_AUTH_TOKEN")
 	fromNumber := os.Getenv("TWILIO_WHATSAPP_NUMBER")
 
 	apiURL := fmt.Sprintf("https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json", accountSID)
-
 	msgData := url.Values{}
 	msgData.Set("To", "whatsapp:"+to)
 	msgData.Set("From", fromNumber)
@@ -378,6 +325,41 @@ func sendWhatsAppMessage(to, body string) error {
 	return nil
 }
 
+func sendMetaMessage(to, body string) error {
+	accessToken := os.Getenv("META_ACCESS_TOKEN")
+	phoneNumberID := os.Getenv("META_PHONE_NUMBER_ID")
+
+	apiURL := fmt.Sprintf("https://graph.facebook.com/v18.0/%s/messages", phoneNumberID)
+
+	payload := map[string]interface{}{
+		"messaging_product": "whatsapp",
+		"to":                to,
+		"type":              "text",
+		"text":              map[string]string{"body": body},
+	}
+
+	payloadBytes, _ := json.Marshal(payload)
+	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(payloadBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("meta error: %s - %s", resp.Status, string(body))
+	}
+	return nil
+}
+
 // --- Notification helpers ---
 
 func notifyAdmin(orderID, phone, items string, total float64, session *Session) {
@@ -385,18 +367,15 @@ func notifyAdmin(orderID, phone, items string, total float64, session *Session) 
 	if shopName == "" {
 		shopName = "Supermarket"
 	}
-
 	deliveryInfo := fmt.Sprintf("Pickup: %s", session.Pickup)
 	if session.DeliveryType == "delivery" {
 		deliveryInfo = fmt.Sprintf("Delivery to: %s", session.DeliveryAddress)
 	}
-
 	msg := fmt.Sprintf(
 		"🔔 *New Paid Order - %s*\n\nOrder ID: *%s*\nCustomer: %s\nItems: %s\nTotal: ₦%.0f\n%s\n\nUpdate status at: %s/admin/orders",
 		shopName, orderID, phone, items, total, deliveryInfo,
 		os.Getenv("RAILWAY_PUBLIC_DOMAIN"),
 	)
-
 	adminPhones := strings.Split(os.Getenv("ADMIN_PHONE"), ",")
 	for _, adminPhone := range adminPhones {
 		adminPhone = strings.TrimSpace(adminPhone)
@@ -413,7 +392,6 @@ func notifyCustomer(phone, orderID, status string) {
 	if shopName == "" {
 		shopName = "Supermarket"
 	}
-
 	var msg string
 	switch status {
 	case "ready":
@@ -423,12 +401,57 @@ func notifyCustomer(phone, orderID, status string) {
 	case "completed":
 		msg = fmt.Sprintf("🎉 *Order Completed!*\n\nYour order *#%s* has been marked as completed.\n\nThank you for shopping at %s! We hope to see you again soon. 😊", orderID, shopName)
 	}
-
 	if msg != "" {
 		if err := sendWhatsAppMessage(phone, msg); err != nil {
 			log.Printf("Failed to notify customer: %v", err)
 		}
 	}
+}
+
+// --- Paystack helpers ---
+
+func createPaystackPaymentLink(orderID, phone string, totalKobo int) (string, error) {
+	secretKey := os.Getenv("PAYSTACK_SECRET_KEY")
+	payload := map[string]interface{}{
+		"email":     phone + "@bot.com",
+		"amount":    totalKobo,
+		"reference": "ORDER-" + orderID + "-" + fmt.Sprintf("%d", time.Now().UnixMilli()),
+		"metadata": map[string]string{
+			"order_id": orderID,
+			"phone":    phone,
+		},
+		"callback_url": os.Getenv("RAILWAY_PUBLIC_DOMAIN") + "/paystack/callback",
+	}
+	payloadBytes, _ := json.Marshal(payload)
+	req, err := http.NewRequest("POST", "https://api.paystack.co/transaction/initialize", strings.NewReader(string(payloadBytes)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+secretKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Status bool `json:"status"`
+		Data   struct {
+			AuthorizationURL string `json:"authorization_url"`
+			Reference        string `json:"reference"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	if !result.Status {
+		return "", fmt.Errorf("paystack error")
+	}
+	db.Exec(`UPDATE orders SET paystack_ref = $1 WHERE order_id = $2`, result.Data.Reference, orderID)
+	return result.Data.AuthorizationURL, nil
 }
 
 // --- Auth middleware ---
@@ -440,7 +463,6 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
-
 		if r.Method == http.MethodPost {
 			r.ParseForm()
 			password := r.FormValue("password")
@@ -458,7 +480,6 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			showLoginPage(w, "❌ Wrong password. Try again.")
 			return
 		}
-
 		showLoginPage(w, "")
 	}
 }
@@ -468,12 +489,10 @@ func showLoginPage(w http.ResponseWriter, errMsg string) {
 	if shopName == "" {
 		shopName = "Supermarket"
 	}
-
 	errHTML := ""
 	if errMsg != "" {
 		errHTML = fmt.Sprintf(`<div class="error">%s</div>`, errMsg)
 	}
-
 	w.Header().Set("Content-Type", "text/html")
 	fmt.Fprintf(w, `<!DOCTYPE html>
 <html>
@@ -514,11 +533,9 @@ func handleMessage(from, message string) string {
 	if shopName == "" {
 		shopName = "our store"
 	}
-
 	message = strings.TrimSpace(message)
 	messageLower := strings.ToLower(message)
 
-	// Track order by ID
 	if strings.HasPrefix(messageLower, "track ") || strings.HasPrefix(messageLower, "status ") {
 		parts := strings.Fields(message)
 		if len(parts) == 2 {
@@ -546,7 +563,6 @@ func handleMessage(from, message string) string {
 		}
 	}
 
-	// Order history
 	if messageLower == "orders" || messageLower == "my orders" {
 		orders, err := getOrdersByPhone(from)
 		if err != nil || len(orders) == 0 {
@@ -570,7 +586,6 @@ func handleMessage(from, message string) string {
 		session = sessions[from]
 	}
 
-	// Back navigation
 	if messageLower == "back" {
 		switch session.State {
 		case "QUANTITY":
@@ -604,7 +619,6 @@ func handleMessage(from, message string) string {
 	}
 
 	switch session.State {
-
 	case "GREETING":
 		session.State = "BROWSING"
 		categories, _ := getCategories()
@@ -635,14 +649,12 @@ func handleMessage(from, message string) string {
 				}
 			}
 		}
-
 		var products []Product
 		if session.BrowsingCategory != "" {
 			products, _ = getProductsByCategory(session.BrowsingCategory)
 		} else {
 			products, _ = getProducts()
 		}
-
 		for i, p := range products {
 			if messageLower == fmt.Sprintf("%d", i+1) {
 				session.State = "QUANTITY"
@@ -650,7 +662,6 @@ func handleMessage(from, message string) string {
 				return fmt.Sprintf("How many of *%s* would you like?\n\nReply with a number or type *back* to go back.", p.Name)
 			}
 		}
-
 		if messageLower == "remove" || messageLower == "remove item" {
 			if len(session.Cart) == 0 {
 				return "Your cart is empty. Nothing to remove."
@@ -727,25 +738,19 @@ func handleMessage(from, message string) string {
 	case "CONFIRM":
 		if messageLower == "yes" || messageLower == "confirm" {
 			total := calculateTotal(session)
-
-			// Save order first (as pending_payment)
 			orderID, err := saveOrder(from, session, total)
 			if err != nil {
 				log.Printf("Error saving order: %v", err)
 				return "Sorry, there was an error processing your order. Please try again."
 			}
-
 			session.PendingOrderID = orderID
 			session.State = "AWAITING_PAYMENT"
-
-			// Generate Paystack payment link
-			totalKobo := int(total * 100) // Paystack uses kobo
+			totalKobo := int(total * 100)
 			paymentLink, err := createPaystackPaymentLink(orderID, from, totalKobo)
 			if err != nil {
 				log.Printf("Error creating payment link: %v", err)
 				return "Sorry, there was an error generating your payment link. Please try again."
 			}
-
 			return fmt.Sprintf(
 				"💳 *Almost there!*\n\nYour order *#%s* is reserved.\n\n*Please complete payment to confirm:*\n\n%s\n\n⏰ Payment link expires in 30 minutes.\n\nOnce payment is confirmed, you'll receive a confirmation message automatically.",
 				orderID, paymentLink,
@@ -880,21 +885,108 @@ func calculateTotal(session *Session) float64 {
 	return total
 }
 
-// --- Paystack webhook handler ---
+// --- Webhook handlers ---
 
+// Twilio webhook
+func twilioWebhookHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+	from := strings.TrimPrefix(r.FormValue("From"), "whatsapp:")
+	body := r.FormValue("Body")
+	log.Printf("[Twilio] Message from %s: %s", from, body)
+	reply := handleMessage(from, body)
+	if err := sendWhatsAppMessage(from, reply); err != nil {
+		log.Printf("Error sending message: %v", err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// Meta webhook verification
+func metaWebhookHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		// Webhook verification
+		verifyToken := os.Getenv("WEBHOOK_VERIFY_TOKEN")
+		mode := r.URL.Query().Get("hub.mode")
+		token := r.URL.Query().Get("hub.verify_token")
+		challenge := r.URL.Query().Get("hub.challenge")
+
+		if mode == "subscribe" && token == verifyToken {
+			log.Println("✅ Meta webhook verified!")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, challenge)
+			return
+		}
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+
+		var event struct {
+			Entry []struct {
+				Changes []struct {
+					Value struct {
+						Messages []struct {
+							From string `json:"from"`
+							Text struct {
+								Body string `json:"body"`
+							} `json:"text"`
+							Type string `json:"type"`
+						} `json:"messages"`
+					} `json:"value"`
+				} `json:"changes"`
+			} `json:"entry"`
+		}
+
+		if err := json.Unmarshal(body, &event); err != nil {
+			log.Printf("Error parsing Meta webhook: %v", err)
+			return
+		}
+
+		for _, entry := range event.Entry {
+			for _, change := range entry.Changes {
+				for _, msg := range change.Value.Messages {
+					if msg.Type == "text" {
+						from := msg.From
+						text := msg.Text.Body
+						log.Printf("[Meta] Message from %s: %s", from, text)
+						reply := handleMessage(from, text)
+						if err := sendWhatsAppMessage(from, reply); err != nil {
+							log.Printf("Error sending Meta message: %v", err)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// Paystack webhook
 func paystackWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
 
-	// Verify webhook signature
 	secretKey := os.Getenv("PAYSTACK_SECRET_KEY")
 	mac := hmac.New(sha512.New, []byte(secretKey))
 	mac.Write(body)
@@ -916,7 +1008,6 @@ func paystackWebhookHandler(w http.ResponseWriter, r *http.Request) {
 				OrderID string `json:"order_id"`
 				Phone   string `json:"phone"`
 			} `json:"metadata"`
-			Amount int `json:"amount"`
 		} `json:"data"`
 	}
 
@@ -931,17 +1022,14 @@ func paystackWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		orderID := event.Data.Metadata.OrderID
 		phone := event.Data.Metadata.Phone
 
-		// Update order payment status
 		db.Exec(`UPDATE orders SET payment_status = 'paid', status = 'pending' WHERE order_id = $1`, orderID)
 
-		// Get order details for admin notification
 		var items string
 		var total float64
 		var deliveryType, deliveryAddress, pickupSlot string
 		db.QueryRow(`SELECT items, total, delivery_type, delivery_address, pickup_slot FROM orders WHERE order_id = $1`, orderID).
 			Scan(&items, &total, &deliveryType, &deliveryAddress, &pickupSlot)
 
-		// Notify admin
 		go func() {
 			fakeSession := &Session{
 				DeliveryType:    deliveryType,
@@ -951,7 +1039,6 @@ func paystackWebhookHandler(w http.ResponseWriter, r *http.Request) {
 			notifyAdmin(orderID, phone, items, total, fakeSession)
 		}()
 
-		// Notify customer
 		go func() {
 			shopName := os.Getenv("SHOP_NAME")
 			if shopName == "" {
@@ -966,8 +1053,6 @@ func paystackWebhookHandler(w http.ResponseWriter, r *http.Request) {
 				orderID, shopName, pickupInfo, orderID,
 			)
 			sendWhatsAppMessage(phone, msg)
-
-			// Update session state
 			for _, session := range sessions {
 				if session.PendingOrderID == orderID {
 					session.State = "DONE"
@@ -986,7 +1071,6 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 	if shopName == "" {
 		shopName = "Supermarket"
 	}
-
 	productsActive := ""
 	ordersActive := ""
 	if activeTab == "products" {
@@ -994,7 +1078,6 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 	} else {
 		ordersActive = "active"
 	}
-
 	fmt.Fprintf(w, `<!DOCTYPE html>
 <html>
 <head>
@@ -1034,7 +1117,6 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 		.product-info { flex: 1; }
 		.product-name { font-weight: bold; font-size: 15px; }
 		.product-price { color: #4CAF50; font-size: 14px; margin-top: 2px; }
-		.product-category { color: #888; font-size: 12px; margin-top: 2px; }
 		.product-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 		.unavailable { opacity: 0.5; }
 		.unavailable .product-name { text-decoration: line-through; }
@@ -1070,35 +1152,6 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 		<a href="/admin/orders" class="tab %s">🧾 Orders</a>
 	</div>
 	<div class="container">`, shopName, shopName, productsActive, ordersActive)
-}
-
-// --- Webhook handler ---
-
-func webhookHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "Bad request", http.StatusBadRequest)
-		return
-	}
-
-	from := r.FormValue("From")
-	body := r.FormValue("Body")
-	from = strings.TrimPrefix(from, "whatsapp:")
-
-	log.Printf("Message from %s: %s", from, body)
-
-	reply := handleMessage(from, body)
-
-	if err := sendWhatsAppMessage(from, reply); err != nil {
-		log.Printf("Error sending message: %v", err)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // --- Admin products handler ---
@@ -1138,7 +1191,6 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	products, _ := getAllProducts()
-
 	w.Header().Set("Content-Type", "text/html")
 	adminHeader(w, "products")
 
@@ -1171,7 +1223,6 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 			currentCategory = p.Category
 			fmt.Fprintf(w, `<div style="margin-top:12px"><strong style="color:#4CAF50">📁 %s</strong></div><div>`, p.Category)
 		}
-
 		availableClass := ""
 		toggleLabel := "Hide"
 		toggleClass := "btn-orange"
@@ -1180,7 +1231,6 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 			toggleLabel = "Show"
 			toggleClass = "btn-green"
 		}
-
 		fmt.Fprintf(w, `
 		<div class="product-item %s">
 			<div class="product-info">
@@ -1207,7 +1257,6 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 			</div>
 		</div>`, availableClass, p.Name, p.Price, p.ID, p.ID, toggleClass, toggleLabel, p.ID)
 	}
-
 	fmt.Fprintf(w, `</div></div></div></body></html>`)
 }
 
@@ -1218,21 +1267,17 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 		r.ParseForm()
 		orderID := r.FormValue("id")
 		newStatus := r.FormValue("status")
-
 		var phone string
 		db.QueryRow(`SELECT phone FROM orders WHERE order_id = $1`, orderID).Scan(&phone)
 		db.Exec(`UPDATE orders SET status = $1 WHERE order_id = $2`, newStatus, orderID)
-
 		if phone != "" {
 			go notifyCustomer(phone, orderID, newStatus)
 		}
-
 		http.Redirect(w, r, "/admin/orders", http.StatusSeeOther)
 		return
 	}
 
 	search := r.URL.Query().Get("search")
-
 	var totalOrders int
 	var totalRevenue float64
 	var pendingOrders int
@@ -1249,7 +1294,6 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		rows, err = db.Query(`SELECT order_id, phone, items, total, delivery_type, delivery_address, pickup_slot, status, payment_status, created_at FROM orders ORDER BY created_at DESC`)
 	}
-
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -1291,7 +1335,6 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	if search != "" {
 		clearBtn = `<a href="/admin/orders" class="btn btn-red" style="width:auto;padding:10px 18px;text-decoration:none;display:inline-block">Clear</a>`
 	}
-
 	fmt.Fprintf(w, `
 	<div class="search-bar">
 		<form method="GET" action="/admin/orders" style="display:flex;gap:10px;flex:1">
@@ -1309,9 +1352,6 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 
 	for _, o := range orders {
 		badgeClass := "badge-" + o.Status
-		payBadgeClass := o.PaymentStatus
-		payBadgeLabel := o.PaymentStatus
-
 		deliveryInfo := fmt.Sprintf("🏪 Pickup: %s", o.PickupSlot)
 		deliveryBadge := `<span class="delivery-badge pickup">Pickup</span>`
 		statusOptions := `
@@ -1328,7 +1368,6 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 			<option value="completed" ` + selected(o.Status, "completed") + `>Completed</option>`
 		}
 
-		// Only show status update for paid orders
 		statusForm := `<p style="color:#999;font-size:13px">⏳ Awaiting payment</p>`
 		if o.PaymentStatus == "paid" {
 			statusForm = fmt.Sprintf(`
@@ -1354,13 +1393,12 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 			</div>
 			%s
 		</div>`,
-			o.OrderID, deliveryBadge, payBadgeClass, payBadgeLabel,
+			o.OrderID, deliveryBadge, o.PaymentStatus, o.PaymentStatus,
 			badgeClass, o.Status,
 			o.Phone, o.Items, o.Total, deliveryInfo, o.CreatedAt,
 			statusForm,
 		)
 	}
-
 	fmt.Fprintf(w, `</div></body></html>`)
 }
 
@@ -1394,7 +1432,9 @@ func main() {
 		port = "8080"
 	}
 
-	http.HandleFunc("/webhook", webhookHandler)
+	// Both Twilio and Meta webhooks
+	http.HandleFunc("/webhook", twilioWebhookHandler)
+	http.HandleFunc("/meta/webhook", metaWebhookHandler)
 	http.HandleFunc("/paystack/webhook", paystackWebhookHandler)
 	http.HandleFunc("/admin", requireAuth(adminHandler))
 	http.HandleFunc("/admin/orders", requireAuth(adminOrdersHandler))
