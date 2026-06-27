@@ -28,14 +28,19 @@ type CartItem struct {
 }
 
 type Session struct {
-	State  string
-	Cart   []CartItem
-	Pickup string
+	State           string
+	PreviousState   string
+	Cart            []CartItem
+	Pickup          string
+	DeliveryType    string // "pickup" or "delivery"
+	DeliveryAddress string
 }
 
 // --- Globals ---
 
 var sessions = map[string]*Session{}
+
+const DeliveryFee = 500.0
 
 var pickupSlots = []string{
 	"10:00 AM - 11:00 AM",
@@ -71,7 +76,9 @@ func initDB() {
 		phone TEXT NOT NULL,
 		items TEXT NOT NULL,
 		total REAL NOT NULL,
-		pickup_slot TEXT NOT NULL,
+		delivery_type TEXT DEFAULT 'pickup',
+		delivery_address TEXT DEFAULT '',
+		pickup_slot TEXT DEFAULT '',
 		status TEXT DEFAULT 'pending',
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);`)
@@ -89,6 +96,10 @@ func initDB() {
 	if err != nil {
 		log.Fatal("Failed to create products table:", err)
 	}
+
+	// Add missing columns if they don't exist (for existing databases)
+	db.Exec(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_type TEXT DEFAULT 'pickup'`)
+	db.Exec(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_address TEXT DEFAULT ''`)
 
 	log.Println("✅ Database ready")
 }
@@ -129,18 +140,18 @@ func getProducts() ([]Product, error) {
 
 // --- Order helpers ---
 
-func saveOrder(phone string, cart []CartItem, pickup string, total float64) (string, error) {
+func saveOrder(phone string, session *Session, total float64) (string, error) {
 	orderID := generateOrderID()
 
 	var itemParts []string
-	for _, item := range cart {
+	for _, item := range session.Cart {
 		itemParts = append(itemParts, fmt.Sprintf("%s x%d", item.Product.Name, item.Quantity))
 	}
 	itemsStr := strings.Join(itemParts, ", ")
 
 	_, err := db.Exec(
-		`INSERT INTO orders (order_id, phone, items, total, pickup_slot) VALUES ($1, $2, $3, $4, $5)`,
-		orderID, phone, itemsStr, total, pickup,
+		`INSERT INTO orders (order_id, phone, items, total, delivery_type, delivery_address, pickup_slot) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		orderID, phone, itemsStr, total, session.DeliveryType, session.DeliveryAddress, session.Pickup,
 	)
 	if err != nil {
 		return "", err
@@ -151,7 +162,7 @@ func saveOrder(phone string, cart []CartItem, pickup string, total float64) (str
 
 func getOrdersByPhone(phone string) ([]string, error) {
 	rows, err := db.Query(
-		`SELECT order_id, items, total, pickup_slot, status, created_at FROM orders WHERE phone = $1 ORDER BY created_at DESC LIMIT 5`,
+		`SELECT order_id, items, total, delivery_type, pickup_slot, status, created_at FROM orders WHERE phone = $1 ORDER BY created_at DESC LIMIT 5`,
 		phone,
 	)
 	if err != nil {
@@ -161,10 +172,14 @@ func getOrdersByPhone(phone string) ([]string, error) {
 
 	var lines []string
 	for rows.Next() {
-		var orderID, items, pickupSlot, status, createdAt string
+		var orderID, items, deliveryType, pickupSlot, status, createdAt string
 		var total float64
-		rows.Scan(&orderID, &items, &total, &pickupSlot, &status, &createdAt)
-		lines = append(lines, fmt.Sprintf("• *%s* — %s\n  ₦%.0f | %s | _%s_", orderID, items, total, pickupSlot, status))
+		rows.Scan(&orderID, &items, &total, &deliveryType, &pickupSlot, &status, &createdAt)
+		delivery := pickupSlot
+		if deliveryType == "delivery" {
+			delivery = "Delivery"
+		}
+		lines = append(lines, fmt.Sprintf("• *%s* — %s\n  ₦%.0f | %s | _%s_", orderID, items, total, delivery, status))
 	}
 	return lines, nil
 }
@@ -205,7 +220,7 @@ func sendWhatsAppMessage(to, body string) error {
 
 // --- Notification helpers ---
 
-func notifyAdmin(orderID, phone, items string, total float64, pickup string) {
+func notifyAdmin(orderID, phone, items string, total float64, session *Session) {
 	adminPhone := os.Getenv("ADMIN_PHONE")
 	shopName := os.Getenv("SHOP_NAME")
 	if shopName == "" {
@@ -214,9 +229,15 @@ func notifyAdmin(orderID, phone, items string, total float64, pickup string) {
 	if adminPhone == "" {
 		return
 	}
+
+	deliveryInfo := fmt.Sprintf("Pickup: %s", session.Pickup)
+	if session.DeliveryType == "delivery" {
+		deliveryInfo = fmt.Sprintf("Delivery to: %s", session.DeliveryAddress)
+	}
+
 	msg := fmt.Sprintf(
-		"🔔 *New Order - %s*\n\nOrder ID: *%s*\nCustomer: %s\nItems: %s\nTotal: ₦%.0f\nPickup: %s\n\nUpdate status at: %s/admin/orders",
-		shopName, orderID, phone, items, total, pickup,
+		"🔔 *New Order - %s*\n\nOrder ID: *%s*\nCustomer: %s\nItems: %s\nTotal: ₦%.0f\n%s\n\nUpdate status at: %s/admin/orders",
+		shopName, orderID, phone, items, total, deliveryInfo,
 		os.Getenv("RAILWAY_PUBLIC_DOMAIN"),
 	)
 	if err := sendWhatsAppMessage(adminPhone, msg); err != nil {
@@ -240,6 +261,11 @@ func notifyCustomer(phone, orderID, status string) {
 	case "completed":
 		msg = fmt.Sprintf(
 			"🎉 *Order Completed!*\n\nYour order *#%s* has been marked as completed.\n\nThank you for shopping at %s! We hope to see you again soon. 😊",
+			orderID, shopName,
+		)
+	case "out_for_delivery":
+		msg = fmt.Sprintf(
+			"🚚 *Your order is on the way!*\n\nYour order *#%s* from %s is out for delivery.\n\nEstimated arrival: *30 minutes* ⏱️\n\nPlease be available to receive your items!",
 			orderID, shopName,
 		)
 	}
@@ -335,10 +361,11 @@ func handleMessage(from, message string) string {
 		shopName = "our store"
 	}
 
-	message = strings.TrimSpace(strings.ToLower(message))
+	message = strings.TrimSpace(message)
+	messageLower := strings.ToLower(message)
 
 	// Order history command
-	if message == "orders" || message == "my orders" || message == "order history" {
+	if messageLower == "orders" || messageLower == "my orders" || messageLower == "order history" {
 		orders, err := getOrdersByPhone(from)
 		if err != nil || len(orders) == 0 {
 			return "You have no past orders. Send *hi* to start ordering!"
@@ -353,9 +380,42 @@ func handleMessage(from, message string) string {
 	}
 
 	session, exists := sessions[from]
-	if !exists || message == "hi" || message == "hello" || message == "start" {
+	if !exists || messageLower == "hi" || messageLower == "hello" || messageLower == "start" {
 		sessions[from] = &Session{State: "GREETING"}
 		session = sessions[from]
+	}
+
+	// Handle back navigation
+	if messageLower == "back" {
+		switch session.State {
+		case "QUANTITY":
+			// Remove the last item added to cart
+			if len(session.Cart) > 0 {
+				session.Cart = session.Cart[:len(session.Cart)-1]
+			}
+			session.State = "BROWSING"
+			products, _ := getProducts()
+			return fmt.Sprintf("↩️ Went back!\n\n%s", buildCatalogMessage(products))
+		case "DELIVERY_TYPE":
+			session.State = "BROWSING"
+			products, _ := getProducts()
+			return fmt.Sprintf("↩️ Went back!\n\n%s", buildCatalogMessage(products))
+		case "DELIVERY_ADDRESS":
+			session.State = "DELIVERY_TYPE"
+			return fmt.Sprintf("↩️ Went back!\n\n%s", buildDeliveryTypeMessage())
+		case "PICKUP":
+			session.State = "DELIVERY_TYPE"
+			return fmt.Sprintf("↩️ Went back!\n\n%s", buildDeliveryTypeMessage())
+		case "CONFIRM":
+			if session.DeliveryType == "delivery" {
+				session.State = "DELIVERY_ADDRESS"
+				return "↩️ Went back!\n\nPlease enter your delivery address:"
+			}
+			session.State = "PICKUP"
+			return fmt.Sprintf("↩️ Went back!\n\n%s", buildPickupMessage())
+		default:
+			return "Nothing to go back to. Send *hi* to start a new order."
+		}
 	}
 
 	switch session.State {
@@ -371,71 +431,97 @@ func handleMessage(from, message string) string {
 	case "BROWSING":
 		products, _ := getProducts()
 		for i, p := range products {
-			if message == fmt.Sprintf("%d", i+1) {
+			if messageLower == fmt.Sprintf("%d", i+1) {
 				session.State = "QUANTITY"
 				session.Cart = append(session.Cart, CartItem{Product: p, Quantity: 0})
-				return fmt.Sprintf("How many of *%s* would you like? (Reply with a number)", p.Name)
+				return fmt.Sprintf("How many of *%s* would you like?\n\nReply with a number or type *back* to go back.", p.Name)
 			}
 		}
-		if message == "done" || message == "checkout" {
+		if messageLower == "done" || messageLower == "checkout" {
 			if len(session.Cart) == 0 {
 				return "Your cart is empty. Please select at least one item."
 			}
-			session.State = "PICKUP"
-			return buildPickupMessage()
+			session.State = "DELIVERY_TYPE"
+			return buildDeliveryTypeMessage()
 		}
-		return "Please reply with a number from the menu, or type *done* to checkout."
+		return "Please reply with a number from the menu, or type *done* to checkout.\n\nType *back* to go back."
 
 	case "QUANTITY":
 		qty := 0
-		fmt.Sscanf(message, "%d", &qty)
+		fmt.Sscanf(messageLower, "%d", &qty)
 		if qty <= 0 {
-			return "Please enter a valid quantity (e.g. 1, 2, 3...)"
+			return "Please enter a valid quantity (e.g. 1, 2, 3...)\n\nOr type *back* to go back."
 		}
 		session.Cart[len(session.Cart)-1].Quantity = qty
 		session.State = "BROWSING"
 		products, _ := getProducts()
-		return fmt.Sprintf("✅ Added! Reply with another number to add more items, or type *done* to checkout.\n\n%s", buildCatalogMessage(products))
+		return fmt.Sprintf("✅ Added! Reply with another number to add more items, or type *done* to checkout.\n\nType *back* to remove last item.\n\n%s", buildCatalogMessage(products))
+
+	case "DELIVERY_TYPE":
+		if messageLower == "1" || messageLower == "pickup" {
+			session.DeliveryType = "pickup"
+			session.State = "PICKUP"
+			return buildPickupMessage()
+		} else if messageLower == "2" || messageLower == "delivery" {
+			session.DeliveryType = "delivery"
+			session.State = "DELIVERY_ADDRESS"
+			return "📍 Please enter your delivery address:\n\nOr type *back* to go back."
+		}
+		return "Please reply *1* for Pickup or *2* for Delivery.\n\nOr type *back* to go back."
+
+	case "DELIVERY_ADDRESS":
+		if len(message) < 5 {
+			return "Please enter a valid address (at least 5 characters).\n\nOr type *back* to go back."
+		}
+		session.DeliveryAddress = message
+		session.State = "CONFIRM"
+		return buildOrderSummary(session)
 
 	case "PICKUP":
 		slot := 0
-		fmt.Sscanf(message, "%d", &slot)
+		fmt.Sscanf(messageLower, "%d", &slot)
 		if slot < 1 || slot > len(pickupSlots) {
-			return "Please choose a valid slot number."
+			return "Please choose a valid slot number.\n\nOr type *back* to go back."
 		}
 		session.Pickup = pickupSlots[slot-1]
 		session.State = "CONFIRM"
 		return buildOrderSummary(session)
 
 	case "CONFIRM":
-		if message == "yes" || message == "confirm" {
-			total := 0.0
+		if messageLower == "yes" || messageLower == "confirm" {
+			total := calculateTotal(session)
+
 			var itemParts []string
 			for _, item := range session.Cart {
-				total += item.Product.Price * float64(item.Quantity)
 				itemParts = append(itemParts, fmt.Sprintf("%s x%d", item.Product.Name, item.Quantity))
 			}
 			itemsStr := strings.Join(itemParts, ", ")
 
-			orderID, err := saveOrder(from, session.Cart, session.Pickup, total)
+			orderID, err := saveOrder(from, session, total)
 			if err != nil {
 				log.Printf("Error saving order: %v", err)
 				return "Sorry, there was an error saving your order. Please try again."
 			}
 
-			// Notify admin
-			go notifyAdmin(orderID, from, itemsStr, total, session.Pickup)
+			go notifyAdmin(orderID, from, itemsStr, total, session)
 
 			session.State = "DONE"
+
+			if session.DeliveryType == "delivery" {
+				return fmt.Sprintf(
+					"🎉 *Order confirmed!*\n\nYour order ID is *%s*\n🚚 Delivery to: %s\n⏱️ Estimated time: *30 minutes*\n\n📌 *Please save your order ID* — you'll need it to track your order.\n\nWe'll send you a message when your order is on the way!\n\nType *orders* anytime to see your order history.",
+					orderID, session.DeliveryAddress,
+				)
+			}
 			return fmt.Sprintf(
 				"🎉 *Order confirmed!*\n\nYour order ID is *%s*\nPickup time: *%s*\n\n📌 *Please save your order ID* — you'll need it to track your order.\n\nWe'll send you a message when your order is ready for pickup!\n\nType *orders* anytime to see your order history.",
 				orderID, session.Pickup,
 			)
-		} else if message == "no" || message == "cancel" {
+		} else if messageLower == "no" || messageLower == "cancel" {
 			delete(sessions, from)
 			return "Order cancelled. Send *hi* to start again."
 		}
-		return "Please reply *yes* to confirm or *no* to cancel."
+		return "Please reply *yes* to confirm or *no* to cancel.\n\nOr type *back* to make changes."
 
 	case "DONE":
 		return "Your order has been placed! Send *hi* to place a new order or type *orders* to see your order history."
@@ -444,7 +530,18 @@ func handleMessage(from, message string) string {
 	return "Send *hi* to start ordering."
 }
 
-// --- Message builders ---
+// --- Helpers ---
+
+func calculateTotal(session *Session) float64 {
+	total := 0.0
+	for _, item := range session.Cart {
+		total += item.Product.Price * float64(item.Quantity)
+	}
+	if session.DeliveryType == "delivery" {
+		total += DeliveryFee
+	}
+	return total
+}
 
 func buildCatalogMessage(products []Product) string {
 	var sb strings.Builder
@@ -452,8 +549,12 @@ func buildCatalogMessage(products []Product) string {
 	for i, p := range products {
 		sb.WriteString(fmt.Sprintf("%d. %s — ₦%.0f\n", i+1, p.Name, p.Price))
 	}
-	sb.WriteString("\nReply with the *number* of the item you want.\nType *done* when you're ready to checkout.")
+	sb.WriteString("\nReply with the *number* of the item you want.\nType *done* when ready to checkout.\nType *back* to go back.")
 	return sb.String()
+}
+
+func buildDeliveryTypeMessage() string {
+	return fmt.Sprintf("🚚 *How would you like to receive your order?*\n\n1. 🏪 Pickup (Free)\n2. 🚚 Delivery (+₦%.0f)\n\nReply *1* or *2*.\nType *back* to go back.", DeliveryFee)
 }
 
 func buildPickupMessage() string {
@@ -462,22 +563,30 @@ func buildPickupMessage() string {
 	for i, slot := range pickupSlots {
 		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, slot))
 	}
-	sb.WriteString("\nReply with the slot number.")
+	sb.WriteString("\nReply with the slot number.\nType *back* to go back.")
 	return sb.String()
 }
 
 func buildOrderSummary(s *Session) string {
 	var sb strings.Builder
 	sb.WriteString("📋 *Order Summary:*\n\n")
-	total := 0.0
+	subtotal := 0.0
 	for _, item := range s.Cart {
-		subtotal := item.Product.Price * float64(item.Quantity)
-		sb.WriteString(fmt.Sprintf("• %s x%d — ₦%.0f\n", item.Product.Name, item.Quantity, subtotal))
-		total += subtotal
+		itemTotal := item.Product.Price * float64(item.Quantity)
+		sb.WriteString(fmt.Sprintf("• %s x%d — ₦%.0f\n", item.Product.Name, item.Quantity, itemTotal))
+		subtotal += itemTotal
 	}
-	sb.WriteString(fmt.Sprintf("\n*Total: ₦%.0f*", total))
-	sb.WriteString(fmt.Sprintf("\n📍 Pickup: %s", s.Pickup))
-	sb.WriteString("\n\nReply *yes* to confirm or *no* to cancel.")
+	sb.WriteString(fmt.Sprintf("\nSubtotal: ₦%.0f", subtotal))
+	if s.DeliveryType == "delivery" {
+		sb.WriteString(fmt.Sprintf("\nDelivery fee: ₦%.0f", DeliveryFee))
+		sb.WriteString(fmt.Sprintf("\n*Total: ₦%.0f*", subtotal+DeliveryFee))
+		sb.WriteString(fmt.Sprintf("\n\n📍 Deliver to: %s", s.DeliveryAddress))
+		sb.WriteString("\n⏱️ Estimated time: 30 minutes")
+	} else {
+		sb.WriteString(fmt.Sprintf("\n*Total: ₦%.0f*", subtotal))
+		sb.WriteString(fmt.Sprintf("\n\n🏪 Pickup: %s", s.Pickup))
+	}
+	sb.WriteString("\n\nReply *yes* to confirm, *no* to cancel, or *back* to make changes.")
 	return sb.String()
 }
 
@@ -532,9 +641,13 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 		.badge { padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; }
 		.badge-pending { background: #fff3cd; color: #856404; }
 		.badge-ready { background: #d4edda; color: #155724; }
+		.badge-out_for_delivery { background: #fff3cd; color: #856404; }
 		.badge-completed { background: #cce5ff; color: #004085; }
 		.order-details { font-size: 14px; color: #555; margin-bottom: 10px; line-height: 1.6; }
 		.order-total { font-weight: bold; color: #333; }
+		.delivery-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; margin-left: 6px; }
+		.delivery { background: #e3f2fd; color: #1565c0; }
+		.pickup { background: #e8f5e9; color: #2e7d32; }
 		.status-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 		select { padding: 8px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; flex: 1; }
 		.empty { text-align: center; padding: 30px; color: #888; }
@@ -653,13 +766,10 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 		orderID := r.FormValue("id")
 		newStatus := r.FormValue("status")
 
-		// Get customer phone before updating
 		var phone string
 		db.QueryRow(`SELECT phone FROM orders WHERE order_id = $1`, orderID).Scan(&phone)
-
 		db.Exec(`UPDATE orders SET status = $1 WHERE order_id = $2`, newStatus, orderID)
 
-		// Notify customer
 		if phone != "" {
 			go notifyCustomer(phone, orderID, newStatus)
 		}
@@ -668,7 +778,7 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := db.Query(`SELECT order_id, phone, items, total, pickup_slot, status, created_at FROM orders ORDER BY created_at DESC`)
+	rows, err := db.Query(`SELECT order_id, phone, items, total, delivery_type, delivery_address, pickup_slot, status, created_at FROM orders ORDER BY created_at DESC`)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -676,19 +786,21 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type Order struct {
-		OrderID    string
-		Phone      string
-		Items      string
-		Total      float64
-		PickupSlot string
-		Status     string
-		CreatedAt  string
+		OrderID         string
+		Phone           string
+		Items           string
+		Total           float64
+		DeliveryType    string
+		DeliveryAddress string
+		PickupSlot      string
+		Status          string
+		CreatedAt       string
 	}
 
 	var orders []Order
 	for rows.Next() {
 		var o Order
-		rows.Scan(&o.OrderID, &o.Phone, &o.Items, &o.Total, &o.PickupSlot, &o.Status, &o.CreatedAt)
+		rows.Scan(&o.OrderID, &o.Phone, &o.Items, &o.Total, &o.DeliveryType, &o.DeliveryAddress, &o.PickupSlot, &o.Status, &o.CreatedAt)
 		orders = append(orders, o)
 	}
 
@@ -707,37 +819,48 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 			badgeClass = "badge-ready"
 		} else if o.Status == "completed" {
 			badgeClass = "badge-completed"
+		} else if o.Status == "out_for_delivery" {
+			badgeClass = "badge-out_for_delivery"
+		}
+
+		deliveryInfo := fmt.Sprintf("🏪 Pickup: %s", o.PickupSlot)
+		deliveryBadge := `<span class="delivery-badge pickup">Pickup</span>`
+		statusOptions := `
+			<option value="pending" ` + selected(o.Status, "pending") + `>Pending</option>
+			<option value="ready" ` + selected(o.Status, "ready") + `>Ready for pickup</option>
+			<option value="completed" ` + selected(o.Status, "completed") + `>Completed</option>`
+
+		if o.DeliveryType == "delivery" {
+			deliveryInfo = fmt.Sprintf("🚚 Deliver to: %s", o.DeliveryAddress)
+			deliveryBadge = `<span class="delivery-badge delivery">Delivery</span>`
+			statusOptions = `
+			<option value="pending" ` + selected(o.Status, "pending") + `>Pending</option>
+			<option value="out_for_delivery" ` + selected(o.Status, "out_for_delivery") + `>Out for delivery</option>
+			<option value="completed" ` + selected(o.Status, "completed") + `>Completed</option>`
 		}
 
 		fmt.Fprintf(w, `
 		<div class="order-card">
 			<div class="order-header">
-				<span class="order-id">Order #%s</span>
+				<span class="order-id">Order #%s %s</span>
 				<span class="badge %s">%s</span>
 			</div>
 			<div class="order-details">
 				📱 %s<br>
 				🛍️ %s<br>
 				💰 <span class="order-total">₦%.0f</span><br>
-				🕐 %s<br>
+				%s<br>
 				📅 %s
 			</div>
 			<form method="POST" action="/admin/orders" class="status-form">
 				<input type="hidden" name="id" value="%s">
-				<select name="status">
-					<option value="pending" %s>Pending</option>
-					<option value="ready" %s>Ready for pickup</option>
-					<option value="completed" %s>Completed</option>
-				</select>
+				<select name="status">%s</select>
 				<button type="submit" class="btn btn-green">Update</button>
 			</form>
 		</div>`,
-			o.OrderID, badgeClass, o.Status,
-			o.Phone, o.Items, o.Total, o.PickupSlot, o.CreatedAt,
-			o.OrderID,
-			selected(o.Status, "pending"),
-			selected(o.Status, "ready"),
-			selected(o.Status, "completed"),
+			o.OrderID, deliveryBadge, badgeClass, o.Status,
+			o.Phone, o.Items, o.Total, deliveryInfo, o.CreatedAt,
+			o.OrderID, statusOptions,
 		)
 	}
 
