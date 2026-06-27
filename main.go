@@ -1,9 +1,12 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha512"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
@@ -38,6 +41,7 @@ type Session struct {
 	DeliveryType     string
 	DeliveryAddress  string
 	BrowsingCategory string
+	PendingOrderID   string
 }
 
 // --- Globals ---
@@ -83,7 +87,9 @@ func initDB() {
 		delivery_type TEXT DEFAULT 'pickup',
 		delivery_address TEXT DEFAULT '',
 		pickup_slot TEXT DEFAULT '',
-		status TEXT DEFAULT 'pending',
+		status TEXT DEFAULT 'pending_payment',
+		payment_status TEXT DEFAULT 'unpaid',
+		paystack_ref TEXT DEFAULT '',
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);`)
 	if err != nil {
@@ -105,7 +111,12 @@ func initDB() {
 	// Add missing columns for existing databases
 	db.Exec(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_type TEXT DEFAULT 'pickup'`)
 	db.Exec(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_address TEXT DEFAULT ''`)
+	db.Exec(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'unpaid'`)
+	db.Exec(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS paystack_ref TEXT DEFAULT ''`)
 	db.Exec(`ALTER TABLE products ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'General'`)
+
+	// Update old orders that don't have payment_status
+	db.Exec(`UPDATE orders SET payment_status = 'paid', status = 'pending' WHERE payment_status IS NULL OR payment_status = ''`)
 
 	log.Println("✅ Database ready")
 }
@@ -132,10 +143,9 @@ func isOpen() bool {
 	openingHour, _ := strconv.Atoi(os.Getenv("OPENING_HOUR"))
 	closingHour, _ := strconv.Atoi(os.Getenv("CLOSING_HOUR"))
 	if openingHour == 0 && closingHour == 0 {
-		return true // No hours set, always open
+		return true
 	}
-	now := time.Now()
-	hour := now.Hour()
+	hour := time.Now().Hour()
 	return hour >= openingHour && hour < closingHour
 }
 
@@ -216,7 +226,7 @@ func getProductsByCategory(category string) ([]Product, error) {
 
 func isReturningCustomer(phone string) bool {
 	var count int
-	db.QueryRow(`SELECT COUNT(*) FROM orders WHERE phone = $1`, phone).Scan(&count)
+	db.QueryRow(`SELECT COUNT(*) FROM orders WHERE phone = $1 AND payment_status = 'paid'`, phone).Scan(&count)
 	return count > 0
 }
 
@@ -232,7 +242,7 @@ func saveOrder(phone string, session *Session, total float64) (string, error) {
 	itemsStr := strings.Join(itemParts, ", ")
 
 	_, err := db.Exec(
-		`INSERT INTO orders (order_id, phone, items, total, delivery_type, delivery_address, pickup_slot) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		`INSERT INTO orders (order_id, phone, items, total, delivery_type, delivery_address, pickup_slot, status, payment_status) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending_payment', 'unpaid')`,
 		orderID, phone, itemsStr, total, session.DeliveryType, session.DeliveryAddress, session.Pickup,
 	)
 	if err != nil {
@@ -244,7 +254,7 @@ func saveOrder(phone string, session *Session, total float64) (string, error) {
 
 func getOrdersByPhone(phone string) ([]string, error) {
 	rows, err := db.Query(
-		`SELECT order_id, items, total, delivery_type, pickup_slot, status, created_at FROM orders WHERE phone = $1 ORDER BY created_at DESC LIMIT 5`,
+		`SELECT order_id, items, total, delivery_type, pickup_slot, status, payment_status, created_at FROM orders WHERE phone = $1 ORDER BY created_at DESC LIMIT 5`,
 		phone,
 	)
 	if err != nil {
@@ -254,26 +264,84 @@ func getOrdersByPhone(phone string) ([]string, error) {
 
 	var lines []string
 	for rows.Next() {
-		var orderID, items, deliveryType, pickupSlot, status, createdAt string
+		var orderID, items, deliveryType, pickupSlot, status, paymentStatus, createdAt string
 		var total float64
-		rows.Scan(&orderID, &items, &total, &deliveryType, &pickupSlot, &status, &createdAt)
+		rows.Scan(&orderID, &items, &total, &deliveryType, &pickupSlot, &status, &paymentStatus, &createdAt)
 		delivery := pickupSlot
 		if deliveryType == "delivery" {
 			delivery = "Delivery"
 		}
-		lines = append(lines, fmt.Sprintf("• *%s* — %s\n  ₦%.0f | %s | _%s_", orderID, items, total, delivery, status))
+		payIcon := "💳 unpaid"
+		if paymentStatus == "paid" {
+			payIcon = "✅ paid"
+		}
+		lines = append(lines, fmt.Sprintf("• *%s* — %s\n  ₦%.0f | %s | %s | _%s_", orderID, items, total, delivery, payIcon, status))
 	}
 	return lines, nil
 }
 
-func getOrderStatus(orderID string) (string, string, string, float64, error) {
-	var phone, items, status string
+func getOrderStatus(orderID string) (string, string, string, string, float64, error) {
+	var phone, items, status, paymentStatus string
 	var total float64
 	err := db.QueryRow(
-		`SELECT phone, items, status, total FROM orders WHERE order_id = $1`,
+		`SELECT phone, items, status, payment_status, total FROM orders WHERE order_id = $1`,
 		strings.ToUpper(orderID),
-	).Scan(&phone, &items, &status, &total)
-	return phone, items, status, total, err
+	).Scan(&phone, &items, &status, &paymentStatus, &total)
+	return phone, items, status, paymentStatus, total, err
+}
+
+// --- Paystack helpers ---
+
+func createPaystackPaymentLink(orderID, phone string, totalKobo int) (string, error) {
+	secretKey := os.Getenv("PAYSTACK_SECRET_KEY")
+
+	payload := map[string]interface{}{
+		"email":     phone + "@bot.com", // Paystack requires email
+		"amount":    totalKobo,
+		"reference": "ORDER-" + orderID + "-" + fmt.Sprintf("%d", time.Now().UnixMilli()),
+		"metadata": map[string]string{
+			"order_id": orderID,
+			"phone":    phone,
+		},
+		"callback_url": os.Getenv("RAILWAY_PUBLIC_DOMAIN") + "/paystack/callback",
+	}
+
+	payloadBytes, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest("POST", "https://api.paystack.co/transaction/initialize", strings.NewReader(string(payloadBytes)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+secretKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Status bool `json:"status"`
+		Data   struct {
+			AuthorizationURL string `json:"authorization_url"`
+			Reference        string `json:"reference"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	if !result.Status {
+		return "", fmt.Errorf("paystack error")
+	}
+
+	// Save reference to order
+	db.Exec(`UPDATE orders SET paystack_ref = $1 WHERE order_id = $2`, result.Data.Reference, orderID)
+
+	return result.Data.AuthorizationURL, nil
 }
 
 // --- Twilio sender ---
@@ -324,12 +392,11 @@ func notifyAdmin(orderID, phone, items string, total float64, session *Session) 
 	}
 
 	msg := fmt.Sprintf(
-		"🔔 *New Order - %s*\n\nOrder ID: *%s*\nCustomer: %s\nItems: %s\nTotal: ₦%.0f\n%s\n\nUpdate status at: %s/admin/orders",
+		"🔔 *New Paid Order - %s*\n\nOrder ID: *%s*\nCustomer: %s\nItems: %s\nTotal: ₦%.0f\n%s\n\nUpdate status at: %s/admin/orders",
 		shopName, orderID, phone, items, total, deliveryInfo,
 		os.Getenv("RAILWAY_PUBLIC_DOMAIN"),
 	)
 
-	// Support multiple admin numbers separated by comma
 	adminPhones := strings.Split(os.Getenv("ADMIN_PHONE"), ",")
 	for _, adminPhone := range adminPhones {
 		adminPhone = strings.TrimSpace(adminPhone)
@@ -350,20 +417,11 @@ func notifyCustomer(phone, orderID, status string) {
 	var msg string
 	switch status {
 	case "ready":
-		msg = fmt.Sprintf(
-			"✅ *Your order is ready!*\n\nHi! Your order *#%s* at %s is ready for pickup.\n\nPlease come collect your items. Thank you! 🛒",
-			orderID, shopName,
-		)
+		msg = fmt.Sprintf("✅ *Your order is ready!*\n\nHi! Your order *#%s* at %s is ready for pickup.\n\nPlease come collect your items. Thank you! 🛒", orderID, shopName)
 	case "out_for_delivery":
-		msg = fmt.Sprintf(
-			"🚚 *Your order is on the way!*\n\nYour order *#%s* from %s is out for delivery.\n\nEstimated arrival: *30 minutes* ⏱️\n\nPlease be available to receive your items!",
-			orderID, shopName,
-		)
+		msg = fmt.Sprintf("🚚 *Your order is on the way!*\n\nYour order *#%s* from %s is out for delivery.\n\nEstimated arrival: *30 minutes* ⏱️\n\nPlease be available to receive your items!", orderID, shopName)
 	case "completed":
-		msg = fmt.Sprintf(
-			"🎉 *Order Completed!*\n\nYour order *#%s* has been marked as completed.\n\nThank you for shopping at %s! We hope to see you again soon. 😊",
-			orderID, shopName,
-		)
+		msg = fmt.Sprintf("🎉 *Order Completed!*\n\nYour order *#%s* has been marked as completed.\n\nThank you for shopping at %s! We hope to see you again soon. 😊", orderID, shopName)
 	}
 
 	if msg != "" {
@@ -460,12 +518,12 @@ func handleMessage(from, message string) string {
 	message = strings.TrimSpace(message)
 	messageLower := strings.ToLower(message)
 
-	// Check order status by ID
+	// Track order by ID
 	if strings.HasPrefix(messageLower, "track ") || strings.HasPrefix(messageLower, "status ") {
 		parts := strings.Fields(message)
 		if len(parts) == 2 {
 			orderID := strings.ToUpper(parts[1])
-			_, items, status, total, err := getOrderStatus(orderID)
+			_, items, status, paymentStatus, total, err := getOrderStatus(orderID)
 			if err != nil {
 				return fmt.Sprintf("❌ Order *#%s* not found. Please check the order ID and try again.", orderID)
 			}
@@ -477,13 +535,19 @@ func handleMessage(from, message string) string {
 				statusEmoji = "🚚"
 			case "completed":
 				statusEmoji = "🎉"
+			case "pending_payment":
+				statusEmoji = "💳"
 			}
-			return fmt.Sprintf("📦 *Order #%s*\n\nItems: %s\nTotal: ₦%.0f\nStatus: %s *%s*", orderID, items, total, statusEmoji, strings.ToUpper(status))
+			payInfo := ""
+			if paymentStatus == "unpaid" {
+				payInfo = "\n⚠️ *Payment pending* — please complete payment to confirm your order."
+			}
+			return fmt.Sprintf("📦 *Order #%s*\n\nItems: %s\nTotal: ₦%.0f\nStatus: %s *%s*%s", orderID, items, total, statusEmoji, strings.ToUpper(status), payInfo)
 		}
 	}
 
-	// Order history command
-	if messageLower == "orders" || messageLower == "my orders" || messageLower == "order history" {
+	// Order history
+	if messageLower == "orders" || messageLower == "my orders" {
 		orders, err := getOrdersByPhone(from)
 		if err != nil || len(orders) == 0 {
 			return "You have no past orders. Send *hi* to start ordering!"
@@ -499,7 +563,6 @@ func handleMessage(from, message string) string {
 
 	session, exists := sessions[from]
 	if !exists || messageLower == "hi" || messageLower == "hello" || messageLower == "start" {
-		// Check business hours
 		if !isOpen() {
 			return closedMessage()
 		}
@@ -507,7 +570,7 @@ func handleMessage(from, message string) string {
 		session = sessions[from]
 	}
 
-	// Handle back navigation
+	// Back navigation
 	if messageLower == "back" {
 		switch session.State {
 		case "QUANTITY":
@@ -545,7 +608,6 @@ func handleMessage(from, message string) string {
 	case "GREETING":
 		session.State = "BROWSING"
 		categories, _ := getCategories()
-
 		if isReturningCustomer(from) {
 			if len(categories) > 1 {
 				return fmt.Sprintf("👋 Welcome back to *%s*!\n\n%s", shopName, buildCategoryMessage(categories))
@@ -553,7 +615,6 @@ func handleMessage(from, message string) string {
 			products, _ := getProducts()
 			return fmt.Sprintf("👋 Welcome back to *%s*!\n\n%s", shopName, buildCatalogMessage(products))
 		}
-
 		if len(categories) > 1 {
 			return fmt.Sprintf("👋 Welcome to *%s*! We're glad to have you.\n\n%s", shopName, buildCategoryMessage(categories))
 		}
@@ -565,8 +626,6 @@ func handleMessage(from, message string) string {
 
 	case "BROWSING":
 		categories, _ := getCategories()
-
-		// Handle category selection
 		if len(categories) > 1 {
 			for i, cat := range categories {
 				if messageLower == fmt.Sprintf("%d", i+1) || messageLower == strings.ToLower(cat) {
@@ -577,7 +636,6 @@ func handleMessage(from, message string) string {
 			}
 		}
 
-		// Handle product selection
 		var products []Product
 		if session.BrowsingCategory != "" {
 			products, _ = getProductsByCategory(session.BrowsingCategory)
@@ -600,7 +658,6 @@ func handleMessage(from, message string) string {
 			session.State = "REMOVE_ITEM"
 			return buildCartRemoveMessage(session)
 		}
-
 		if messageLower == "done" || messageLower == "checkout" {
 			if len(session.Cart) == 0 {
 				return "Your cart is empty. Please select at least one item."
@@ -608,19 +665,12 @@ func handleMessage(from, message string) string {
 			session.State = "DELIVERY_TYPE"
 			return buildDeliveryTypeMessage()
 		}
-
 		if messageLower == "cart" || messageLower == "view cart" {
 			if len(session.Cart) == 0 {
 				return "Your cart is empty.\n\n" + buildBrowsingMessage(session)
 			}
 			return buildCartMessage(session)
 		}
-
-		if session.BrowsingCategory != "" && (messageLower == "categories" || messageLower == "back to categories") {
-			session.BrowsingCategory = ""
-			return buildCategoryMessage(categories)
-		}
-
 		return "Please reply with a number from the menu.\n\nType *done* to checkout, *cart* to view cart, *remove* to remove an item, or *back* to go back."
 
 	case "REMOVE_ITEM":
@@ -632,7 +682,7 @@ func handleMessage(from, message string) string {
 		removed := session.Cart[idx-1].Product.Name
 		session.Cart = append(session.Cart[:idx-1], session.Cart[idx:]...)
 		session.State = "BROWSING"
-		return fmt.Sprintf("✅ *%s* removed from cart!\n\n%s", removed, buildBrowsingMessage(session))
+		return fmt.Sprintf("✅ *%s* removed!\n\n%s", removed, buildBrowsingMessage(session))
 
 	case "QUANTITY":
 		qty := 0
@@ -678,37 +728,39 @@ func handleMessage(from, message string) string {
 		if messageLower == "yes" || messageLower == "confirm" {
 			total := calculateTotal(session)
 
-			var itemParts []string
-			for _, item := range session.Cart {
-				itemParts = append(itemParts, fmt.Sprintf("%s x%d", item.Product.Name, item.Quantity))
-			}
-			itemsStr := strings.Join(itemParts, ", ")
-
+			// Save order first (as pending_payment)
 			orderID, err := saveOrder(from, session, total)
 			if err != nil {
 				log.Printf("Error saving order: %v", err)
-				return "Sorry, there was an error saving your order. Please try again."
+				return "Sorry, there was an error processing your order. Please try again."
 			}
 
-			go notifyAdmin(orderID, from, itemsStr, total, session)
+			session.PendingOrderID = orderID
+			session.State = "AWAITING_PAYMENT"
 
-			session.State = "DONE"
-
-			if session.DeliveryType == "delivery" {
-				return fmt.Sprintf(
-					"🎉 *Order confirmed!*\n\nYour order ID is *%s*\n🚚 Delivery to: %s\n⏱️ Estimated time: *30 minutes*\n\n📌 *Please save your order ID* — type *track %s* anytime to check your order status.\n\nWe'll send you a message when your order is on the way!\n\nType *orders* to see your order history.",
-					orderID, session.DeliveryAddress, orderID,
-				)
+			// Generate Paystack payment link
+			totalKobo := int(total * 100) // Paystack uses kobo
+			paymentLink, err := createPaystackPaymentLink(orderID, from, totalKobo)
+			if err != nil {
+				log.Printf("Error creating payment link: %v", err)
+				return "Sorry, there was an error generating your payment link. Please try again."
 			}
+
 			return fmt.Sprintf(
-				"🎉 *Order confirmed!*\n\nYour order ID is *%s*\nPickup time: *%s*\n\n📌 *Please save your order ID* — type *track %s* anytime to check your order status.\n\nWe'll send you a message when your order is ready for pickup!\n\nType *orders* to see your order history.",
-				orderID, session.Pickup, orderID,
+				"💳 *Almost there!*\n\nYour order *#%s* is reserved.\n\n*Please complete payment to confirm:*\n\n%s\n\n⏰ Payment link expires in 30 minutes.\n\nOnce payment is confirmed, you'll receive a confirmation message automatically.",
+				orderID, paymentLink,
 			)
 		} else if messageLower == "no" || messageLower == "cancel" {
 			delete(sessions, from)
 			return "Order cancelled. Send *hi* to start again."
 		}
-		return "Please reply *yes* to confirm, *no* to cancel, or *back* to make changes."
+		return "Please reply *yes* to proceed to payment, *no* to cancel, or *back* to make changes."
+
+	case "AWAITING_PAYMENT":
+		return fmt.Sprintf(
+			"⏳ *Waiting for payment...*\n\nYour order *#%s* is reserved pending payment.\n\nPlease complete payment using the link we sent you.\n\nOnce paid, you'll receive a confirmation automatically.\n\nType *track %s* to check your order status.",
+			session.PendingOrderID, session.PendingOrderID,
+		)
 
 	case "DONE":
 		return "Your order has been placed! Send *hi* to place a new order or type *orders* to see your order history."
@@ -726,13 +778,10 @@ func buildBrowsingMessage(session *Session) string {
 	} else {
 		products, _ = getProducts()
 	}
-
 	msg := buildCatalogMessage(products)
-
 	if len(session.Cart) > 0 {
 		msg += fmt.Sprintf("\n\n🛒 *Cart:* %d item(s) — type *cart* to view, *remove* to remove an item", len(session.Cart))
 	}
-
 	return msg
 }
 
@@ -816,7 +865,7 @@ func buildOrderSummary(s *Session) string {
 		sb.WriteString(fmt.Sprintf("\n*Total: ₦%.0f*", subtotal))
 		sb.WriteString(fmt.Sprintf("\n\n🏪 Pickup: %s", s.Pickup))
 	}
-	sb.WriteString("\n\nReply *yes* to confirm, *no* to cancel, or *back* to make changes.")
+	sb.WriteString("\n\nReply *yes* to proceed to payment, *no* to cancel, or *back* to make changes.")
 	return sb.String()
 }
 
@@ -829,6 +878,105 @@ func calculateTotal(session *Session) float64 {
 		total += DeliveryFee
 	}
 	return total
+}
+
+// --- Paystack webhook handler ---
+
+func paystackWebhookHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	// Verify webhook signature
+	secretKey := os.Getenv("PAYSTACK_SECRET_KEY")
+	mac := hmac.New(sha512.New, []byte(secretKey))
+	mac.Write(body)
+	expectedSig := fmt.Sprintf("%x", mac.Sum(nil))
+	receivedSig := r.Header.Get("X-Paystack-Signature")
+
+	if expectedSig != receivedSig {
+		log.Printf("Invalid Paystack signature")
+		http.Error(w, "Invalid signature", http.StatusUnauthorized)
+		return
+	}
+
+	var event struct {
+		Event string `json:"event"`
+		Data  struct {
+			Reference string `json:"reference"`
+			Status    string `json:"status"`
+			Metadata  struct {
+				OrderID string `json:"order_id"`
+				Phone   string `json:"phone"`
+			} `json:"metadata"`
+			Amount int `json:"amount"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &event); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+
+	if event.Event == "charge.success" {
+		orderID := event.Data.Metadata.OrderID
+		phone := event.Data.Metadata.Phone
+
+		// Update order payment status
+		db.Exec(`UPDATE orders SET payment_status = 'paid', status = 'pending' WHERE order_id = $1`, orderID)
+
+		// Get order details for admin notification
+		var items string
+		var total float64
+		var deliveryType, deliveryAddress, pickupSlot string
+		db.QueryRow(`SELECT items, total, delivery_type, delivery_address, pickup_slot FROM orders WHERE order_id = $1`, orderID).
+			Scan(&items, &total, &deliveryType, &deliveryAddress, &pickupSlot)
+
+		// Notify admin
+		go func() {
+			fakeSession := &Session{
+				DeliveryType:    deliveryType,
+				DeliveryAddress: deliveryAddress,
+				Pickup:          pickupSlot,
+			}
+			notifyAdmin(orderID, phone, items, total, fakeSession)
+		}()
+
+		// Notify customer
+		go func() {
+			shopName := os.Getenv("SHOP_NAME")
+			if shopName == "" {
+				shopName = "Supermarket"
+			}
+			pickupInfo := fmt.Sprintf("Pickup time: *%s*", pickupSlot)
+			if deliveryType == "delivery" {
+				pickupInfo = fmt.Sprintf("Delivery to: *%s*\n⏱️ Estimated time: 30 minutes", deliveryAddress)
+			}
+			msg := fmt.Sprintf(
+				"🎉 *Payment confirmed!*\n\nThank you! Your order *#%s* at *%s* has been confirmed.\n\n%s\n\n📌 Type *track %s* to check your order status.\n\nWe'll notify you when your order is ready!",
+				orderID, shopName, pickupInfo, orderID,
+			)
+			sendWhatsAppMessage(phone, msg)
+
+			// Update session state
+			for _, session := range sessions {
+				if session.PendingOrderID == orderID {
+					session.State = "DONE"
+				}
+			}
+		}()
+
+		log.Printf("Payment confirmed for order %s", orderID)
+	}
 }
 
 // --- Shared HTML header ---
@@ -895,9 +1043,13 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 		.order-id { font-weight: bold; font-size: 16px; color: #333; }
 		.badge { padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; }
 		.badge-pending { background: #fff3cd; color: #856404; }
+		.badge-pending_payment { background: #f8d7da; color: #721c24; }
 		.badge-ready { background: #d4edda; color: #155724; }
 		.badge-out_for_delivery { background: #cce5ff; color: #004085; }
 		.badge-completed { background: #e2e3e5; color: #383d41; }
+		.pay-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; margin-left: 6px; }
+		.paid { background: #d4edda; color: #155724; }
+		.unpaid { background: #f8d7da; color: #721c24; }
 		.order-details { font-size: 14px; color: #555; margin-bottom: 10px; line-height: 1.6; }
 		.order-total { font-weight: bold; color: #333; }
 		.delivery-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; margin-left: 6px; }
@@ -906,8 +1058,6 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 		.status-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 		select { padding: 8px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; flex: 1; }
 		.empty { text-align: center; padding: 30px; color: #888; }
-		.edit-price { display: flex; gap: 6px; align-items: center; }
-		.edit-price input { width: 100px; padding: 6px; font-size: 13px; }
 	</style>
 </head>
 <body>
@@ -1081,26 +1231,23 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Search query
 	search := r.URL.Query().Get("search")
 
-	// Daily stats
 	var totalOrders int
 	var totalRevenue float64
 	var pendingOrders int
-	db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(total), 0) FROM orders WHERE created_at::date = CURRENT_DATE`).Scan(&totalOrders, &totalRevenue)
-	db.QueryRow(`SELECT COUNT(*) FROM orders WHERE status = 'pending'`).Scan(&pendingOrders)
+	db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(total), 0) FROM orders WHERE created_at::date = CURRENT_DATE AND payment_status = 'paid'`).Scan(&totalOrders, &totalRevenue)
+	db.QueryRow(`SELECT COUNT(*) FROM orders WHERE status = 'pending' AND payment_status = 'paid'`).Scan(&pendingOrders)
 
-	// Fetch orders
 	var rows *sql.Rows
 	var err error
 	if search != "" {
 		rows, err = db.Query(
-			`SELECT order_id, phone, items, total, delivery_type, delivery_address, pickup_slot, status, created_at FROM orders WHERE order_id ILIKE $1 OR phone ILIKE $1 ORDER BY created_at DESC`,
+			`SELECT order_id, phone, items, total, delivery_type, delivery_address, pickup_slot, status, payment_status, created_at FROM orders WHERE order_id ILIKE $1 OR phone ILIKE $1 ORDER BY created_at DESC`,
 			"%"+search+"%",
 		)
 	} else {
-		rows, err = db.Query(`SELECT order_id, phone, items, total, delivery_type, delivery_address, pickup_slot, status, created_at FROM orders ORDER BY created_at DESC`)
+		rows, err = db.Query(`SELECT order_id, phone, items, total, delivery_type, delivery_address, pickup_slot, status, payment_status, created_at FROM orders ORDER BY created_at DESC`)
 	}
 
 	if err != nil {
@@ -1118,20 +1265,20 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 		DeliveryAddress string
 		PickupSlot      string
 		Status          string
+		PaymentStatus   string
 		CreatedAt       string
 	}
 
 	var orders []Order
 	for rows.Next() {
 		var o Order
-		rows.Scan(&o.OrderID, &o.Phone, &o.Items, &o.Total, &o.DeliveryType, &o.DeliveryAddress, &o.PickupSlot, &o.Status, &o.CreatedAt)
+		rows.Scan(&o.OrderID, &o.Phone, &o.Items, &o.Total, &o.DeliveryType, &o.DeliveryAddress, &o.PickupSlot, &o.Status, &o.PaymentStatus, &o.CreatedAt)
 		orders = append(orders, o)
 	}
 
 	w.Header().Set("Content-Type", "text/html")
 	adminHeader(w, "orders")
 
-	// Stats
 	fmt.Fprintf(w, `
 	<div class="stats">
 		<div class="stat"><div class="stat-value">%d</div><div class="stat-label">Today's Orders</div></div>
@@ -1140,20 +1287,19 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 		<div class="stat"><div class="stat-value">%d</div><div class="stat-label">Total Orders</div></div>
 	</div>`, totalOrders, totalRevenue, pendingOrders, len(orders))
 
-	// Search bar
+	clearBtn := ""
+	if search != "" {
+		clearBtn = `<a href="/admin/orders" class="btn btn-red" style="width:auto;padding:10px 18px;text-decoration:none;display:inline-block">Clear</a>`
+	}
+
 	fmt.Fprintf(w, `
 	<div class="search-bar">
 		<form method="GET" action="/admin/orders" style="display:flex;gap:10px;flex:1">
-			<input type="text" name="search" placeholder="Search by order ID or phone number..." value="%s">
+			<input type="text" name="search" placeholder="Search by order ID or phone..." value="%s">
 			<button type="submit" class="btn btn-green" style="width:auto">Search</button>
 			%s
 		</form>
-	</div>`, search, func() string {
-		if search != "" {
-			return `<a href="/admin/orders" class="btn btn-red" style="width:auto;padding:10px 18px;text-decoration:none;display:inline-block">Clear</a>`
-		}
-		return ""
-	}())
+	</div>`, search, clearBtn)
 
 	fmt.Fprintf(w, `<div class="card"><h2>Orders (%d)</h2></div>`, len(orders))
 
@@ -1162,14 +1308,9 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, o := range orders {
-		badgeClass := "badge-pending"
-		if o.Status == "ready" {
-			badgeClass = "badge-ready"
-		} else if o.Status == "completed" {
-			badgeClass = "badge-completed"
-		} else if o.Status == "out_for_delivery" {
-			badgeClass = "badge-out_for_delivery"
-		}
+		badgeClass := "badge-" + o.Status
+		payBadgeClass := o.PaymentStatus
+		payBadgeLabel := o.PaymentStatus
 
 		deliveryInfo := fmt.Sprintf("🏪 Pickup: %s", o.PickupSlot)
 		deliveryBadge := `<span class="delivery-badge pickup">Pickup</span>`
@@ -1187,10 +1328,21 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 			<option value="completed" ` + selected(o.Status, "completed") + `>Completed</option>`
 		}
 
+		// Only show status update for paid orders
+		statusForm := `<p style="color:#999;font-size:13px">⏳ Awaiting payment</p>`
+		if o.PaymentStatus == "paid" {
+			statusForm = fmt.Sprintf(`
+			<form method="POST" action="/admin/orders" class="status-form">
+				<input type="hidden" name="id" value="%s">
+				<select name="status">%s</select>
+				<button type="submit" class="btn btn-green">Update</button>
+			</form>`, o.OrderID, statusOptions)
+		}
+
 		fmt.Fprintf(w, `
 		<div class="order-card">
 			<div class="order-header">
-				<span class="order-id">Order #%s %s</span>
+				<span class="order-id">Order #%s %s <span class="pay-badge %s">%s</span></span>
 				<span class="badge %s">%s</span>
 			</div>
 			<div class="order-details">
@@ -1200,15 +1352,12 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 				%s<br>
 				📅 %s
 			</div>
-			<form method="POST" action="/admin/orders" class="status-form">
-				<input type="hidden" name="id" value="%s">
-				<select name="status">%s</select>
-				<button type="submit" class="btn btn-green">Update</button>
-			</form>
+			%s
 		</div>`,
-			o.OrderID, deliveryBadge, badgeClass, o.Status,
+			o.OrderID, deliveryBadge, payBadgeClass, payBadgeLabel,
+			badgeClass, o.Status,
 			o.Phone, o.Items, o.Total, deliveryInfo, o.CreatedAt,
-			o.OrderID, statusOptions,
+			statusForm,
 		)
 	}
 
@@ -1246,6 +1395,7 @@ func main() {
 	}
 
 	http.HandleFunc("/webhook", webhookHandler)
+	http.HandleFunc("/paystack/webhook", paystackWebhookHandler)
 	http.HandleFunc("/admin", requireAuth(adminHandler))
 	http.HandleFunc("/admin/orders", requireAuth(adminOrdersHandler))
 	http.HandleFunc("/admin/logout", logoutHandler)
