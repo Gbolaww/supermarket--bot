@@ -1071,6 +1071,18 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 	if shopName == "" {
 		shopName = "Supermarket"
 	}
+	productsActive := ""
+	ordersActive := ""
+	if activeTab == "products" {
+		productsActive = "active"
+	} else {
+		ordersActive = "active"
+	}
+func adminHeader(w http.ResponseWriter, activeTab string) {
+	shopName := os.Getenv("SHOP_NAME")
+	if shopName == "" {
+		shopName = "Supermarket"
+	}
 
 	var totalProducts, totalOrders int
 	db.QueryRow(`SELECT COUNT(*) FROM products`).Scan(&totalProducts)
@@ -1103,7 +1115,7 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 		.nav-item { display: flex; align-items: center; gap: 10px; padding: 12px 20px; color: #e8c7cd; text-decoration: none; font-size: 14px; border-left: 3px solid transparent; }
 		.nav-item:hover { background: rgba(255,255,255,0.06); }
 		.nav-item.active { background: rgba(255,255,255,0.12); color: #fff; border-left: 3px solid #fff; font-weight: 600; }
-		.nav-icon { width: 18px; text-align: center; }
+		.nav-icon { width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center; background: rgba(255,255,255,0.12); border-radius: 5px; font-size: 11px; font-weight: 700; flex-shrink: 0; }
 		.sidebar-help { padding: 18px 20px; font-size: 12px; color: #c79aa1; border-top: 1px solid rgba(255,255,255,0.08); }
 		.sidebar-help strong { display: block; color: #fff; margin-bottom: 4px; }
 
@@ -1179,13 +1191,13 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 		<div class="sidebar">
 			<div class="sidebar-brand">%s</div>
 			<div class="sidebar-nav">
-				<a href="/admin" class="nav-item %s"><span class="nav-icon">📊</span> Dashboard</a>
-				<a href="/admin/orders" class="nav-item %s"><span class="nav-icon">🧾</span> Orders</a>
-				<a href="/admin" class="nav-item %s"><span class="nav-icon">📦</span> Products</a>
-				<a href="#" class="nav-item"><span class="nav-icon">🗂️</span> Categories</a>
-				<a href="#" class="nav-item"><span class="nav-icon">🕐</span> Schedule</a>
-				<a href="#" class="nav-item"><span class="nav-icon">🖼️</span> Image Upload</a>
-				<a href="#" class="nav-item"><span class="nav-icon">⚙️</span> Configure</a>
+				<a href="/admin" class="nav-item %s"><span class="nav-icon">D</span> Dashboard</a>
+				<a href="/admin/orders" class="nav-item %s"><span class="nav-icon">O</span> Orders</a>
+				<a href="/admin" class="nav-item %s"><span class="nav-icon">P</span> Products</a>
+				<a href="#" class="nav-item"><span class="nav-icon">C</span> Categories</a>
+				<a href="#" class="nav-item"><span class="nav-icon">S</span> Schedule</a>
+				<a href="#" class="nav-item"><span class="nav-icon">I</span> Image Upload</a>
+				<a href="#" class="nav-item"><span class="nav-icon">G</span> Configure</a>
 			</div>
 			<div class="sidebar-help">
 				<strong>Need help?</strong>
