@@ -1238,10 +1238,14 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 
 	productsActive := ""
 	ordersActive := ""
-	if activeTab == "products" {
+	categoriesActive := ""
+	switch activeTab {
+	case "products":
 		productsActive = "active"
-	} else {
+	case "orders":
 		ordersActive = "active"
+	case "categories":
+		categoriesActive = "active"
 	}
 
 	fmt.Fprintf(w, `<!DOCTYPE html>
@@ -1342,10 +1346,7 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 				<a href="/admin" class="nav-item %s"><span class="nav-icon">D</span> Dashboard</a>
 				<a href="/admin/orders" class="nav-item %s"><span class="nav-icon">O</span> Orders</a>
 				<a href="/admin" class="nav-item %s"><span class="nav-icon">P</span> Products</a>
-				<a href="#" class="nav-item"><span class="nav-icon">C</span> Categories</a>
-				<a href="#" class="nav-item"><span class="nav-icon">S</span> Schedule</a>
-				<a href="#" class="nav-item"><span class="nav-icon">I</span> Image Upload</a>
-				<a href="#" class="nav-item"><span class="nav-icon">G</span> Configure</a>
+				<a href="/admin/categories" class="nav-item %s"><span class="nav-icon">C</span> Categories</a>
 			</div>
 			<div class="sidebar-help">
 				<strong>Need help?</strong>
@@ -1357,6 +1358,7 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 				<div class="topbar-tabs">
 					<a href="/admin" class="topbar-tab %s">Products</a>
 					<a href="/admin/orders" class="topbar-tab %s">Orders</a>
+					<a href="/admin/categories" class="topbar-tab %s">Categories</a>
 				</div>
 				<div class="topbar-right">
 					<a href="/admin/logout" class="logout-pill">Logout</a>
@@ -1368,7 +1370,7 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 					<div class="stat"><div class="stat-value">%d</div><div class="stat-label">Total Orders</div></div>
 					<div class="stat"><div class="stat-value">NGN</div><div class="stat-label">Currency</div></div>
 					<div class="stat"><div class="stat-value">Live</div><div class="stat-label">Bot Status</div></div>
-				</div>`, shopName, shopName, productsActive, ordersActive, productsActive, productsActive, ordersActive, totalProducts, totalOrders)
+				</div>`, shopName, shopName, productsActive, ordersActive, productsActive, categoriesActive, productsActive, ordersActive, categoriesActive, totalProducts, totalOrders)
 }
 
 func adminFooter(w http.ResponseWriter) {
@@ -1691,6 +1693,80 @@ func selected(current, value string) string {
 	return ""
 }
 
+// --- Admin categories handler ---
+
+func adminCategoriesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.ParseForm()
+		action := r.FormValue("action")
+		switch action {
+		case "rename_category":
+			oldName := r.FormValue("old_name")
+			newName := strings.TrimSpace(r.FormValue("new_name"))
+			if newName != "" && oldName != "" {
+				db.Exec(`UPDATE products SET category = $1 WHERE category = $2`, newName, oldName)
+			}
+		}
+		http.Redirect(w, r, "/admin/categories", http.StatusSeeOther)
+		return
+	}
+
+	type CategorySummary struct {
+		Name         string
+		ProductCount int
+		VisibleCount int
+	}
+
+	rows, err := db.Query(`
+		SELECT category, COUNT(*), COUNT(*) FILTER (WHERE available = true)
+		FROM products
+		GROUP BY category
+		ORDER BY category`)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var categories []CategorySummary
+	for rows.Next() {
+		var c CategorySummary
+		rows.Scan(&c.Name, &c.ProductCount, &c.VisibleCount)
+		categories = append(categories, c)
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	adminHeader(w, "categories")
+
+	fmt.Fprintf(w, `<div class="card"><h2>Categories (%d)</h2>`, len(categories))
+	fmt.Fprintf(w, `<p style="color:#888;font-size:13px;margin-bottom:16px">Categories are created automatically when you add a product with a new category name on the Products page. Rename a category here to update it across all its products.</p>`)
+
+	if len(categories) == 0 {
+		fmt.Fprintf(w, `<div class="empty">No categories yet. Add a product with a category on the Products page.</div></div>`)
+	} else {
+		fmt.Fprintf(w, `<div class="table-wrap"><table class="data-table"><tr><th>Category</th><th>Total Products</th><th>Visible</th><th>Rename</th></tr>`)
+		for _, c := range categories {
+			fmt.Fprintf(w, `
+			<tr>
+				<td><span class="cat-pill">%s</span></td>
+				<td>%d</td>
+				<td>%d</td>
+				<td>
+					<form method="POST" action="/admin/categories" style="display:flex;gap:6px">
+						<input type="hidden" name="action" value="rename_category">
+						<input type="hidden" name="old_name" value="%s">
+						<input type="text" name="new_name" placeholder="New name" style="width:140px;padding:6px;font-size:12px">
+						<button type="submit" class="btn btn-blue btn-sm">Rename</button>
+					</form>
+				</td>
+			</tr>`, c.Name, c.ProductCount, c.VisibleCount, c.Name)
+		}
+		fmt.Fprintf(w, `</table></div></div>`)
+	}
+
+	adminFooter(w)
+}
+
 // --- Logout handler ---
 
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
@@ -1720,6 +1796,7 @@ func main() {
 	http.HandleFunc("/paystack/webhook", paystackWebhookHandler)
 	http.HandleFunc("/admin", requireAuth(adminHandler))
 	http.HandleFunc("/admin/orders", requireAuth(adminOrdersHandler))
+	http.HandleFunc("/admin/categories", requireAuth(adminCategoriesHandler))
 	http.HandleFunc("/admin/logout", logoutHandler)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("OK"))
