@@ -507,7 +507,7 @@ func showLoginPage(w http.ResponseWriter, errMsg string) {
 		h1 { text-align: center; color: #333; font-size: 20px; margin-bottom: 6px; }
 		p { text-align: center; color: #888; font-size: 14px; margin-bottom: 24px; }
 		input[type=password] { width: 100%%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 15px; margin-bottom: 14px; }
-		button { width: 100%%; padding: 12px; background: #4CAF50; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; }
+		button { width: 100%%; padding: 12px; background: #5c0e1e; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; }
 		.error { background: #ffe0e0; color: #c00; padding: 10px; border-radius: 6px; margin-bottom: 14px; text-align: center; font-size: 14px; }
 	</style>
 </head>
@@ -1071,6 +1071,11 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 	if shopName == "" {
 		shopName = "Supermarket"
 	}
+
+	var totalProducts, totalOrders int
+	db.QueryRow(`SELECT COUNT(*) FROM products`).Scan(&totalProducts)
+	db.QueryRow(`SELECT COUNT(*) FROM orders`).Scan(&totalOrders)
+
 	productsActive := ""
 	ordersActive := ""
 	if activeTab == "products" {
@@ -1078,6 +1083,7 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 	} else {
 		ordersActive = "active"
 	}
+
 	fmt.Fprintf(w, `<!DOCTYPE html>
 <html>
 <head>
@@ -1085,73 +1091,128 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<style>
 		* { box-sizing: border-box; margin: 0; padding: 0; }
-		body { font-family: Arial, sans-serif; background: #f5f5f5; font-size: 15px; }
-		.header { background: #4CAF50; color: white; padding: 16px; display: flex; justify-content: space-between; align-items: center; }
-		.header h1 { font-size: 20px; }
-		.logout { color: white; font-size: 13px; text-decoration: none; background: rgba(0,0,0,0.2); padding: 6px 12px; border-radius: 6px; }
-		.tabs { display: flex; gap: 8px; padding: 16px; background: white; border-bottom: 1px solid #eee; }
-		.tab { flex: 1; text-align: center; padding: 10px; background: #f5f5f5; border: 2px solid #4CAF50; border-radius: 6px; color: #4CAF50; font-weight: bold; text-decoration: none; font-size: 14px; }
-		.tab.active { background: #4CAF50; color: white; }
-		.container { padding: 16px; max-width: 900px; margin: auto; }
-		.card { background: white; border-radius: 8px; padding: 16px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-		.card h2 { margin-bottom: 12px; color: #333; font-size: 16px; }
-		.stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 16px; }
-		@media(min-width: 600px) { .stats { grid-template-columns: repeat(4, 1fr); } }
-		.stat { background: white; border-radius: 8px; padding: 14px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-		.stat-value { font-size: 24px; font-weight: bold; color: #4CAF50; }
-		.stat-label { font-size: 12px; color: #888; margin-top: 4px; }
-		.search-bar { display: flex; gap: 10px; margin-bottom: 16px; }
-		.search-bar input { flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 15px; }
+		body { font-family: 'Segoe UI', Arial, sans-serif; background: #f1f2f6; font-size: 14px; color: #333; }
+
+		/* Layout shell */
+		.shell { display: flex; min-height: 100vh; }
+
+		/* Sidebar */
+		.sidebar { width: 230px; background: #5c0e1e; color: #f1d9dd; flex-shrink: 0; display: flex; flex-direction: column; }
+		.sidebar-brand { padding: 22px 20px; font-size: 22px; font-weight: 800; font-style: italic; color: #fff; border-bottom: 1px solid rgba(255,255,255,0.08); }
+		.sidebar-nav { flex: 1; padding: 10px 0; }
+		.nav-item { display: flex; align-items: center; gap: 10px; padding: 12px 20px; color: #e8c7cd; text-decoration: none; font-size: 14px; border-left: 3px solid transparent; }
+		.nav-item:hover { background: rgba(255,255,255,0.06); }
+		.nav-item.active { background: rgba(255,255,255,0.12); color: #fff; border-left: 3px solid #fff; font-weight: 600; }
+		.nav-icon { width: 18px; text-align: center; }
+		.sidebar-help { padding: 18px 20px; font-size: 12px; color: #c79aa1; border-top: 1px solid rgba(255,255,255,0.08); }
+		.sidebar-help strong { display: block; color: #fff; margin-bottom: 4px; }
+
+		/* Main area */
+		.main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+		.topbar { background: #fff; padding: 14px 24px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+		.topbar-tabs { display: flex; gap: 8px; }
+		.topbar-tab { padding: 8px 16px; border-radius: 6px; font-size: 13px; font-weight: 600; text-decoration: none; color: #5c0e1e; background: #f1e3e5; }
+		.topbar-tab.active { background: #5c0e1e; color: #fff; }
+		.topbar-right { display: flex; align-items: center; gap: 12px; }
+		.logout-pill { background: #5c0e1e; color: #fff; padding: 8px 16px; border-radius: 6px; text-decoration: none; font-size: 13px; font-weight: 600; }
+
+		.content { padding: 24px; max-width: 1200px; width: 100%%; margin: 0 auto; }
+
+		/* Stat cards */
+		.stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-bottom: 24px; }
+		@media(min-width: 700px) { .stats { grid-template-columns: repeat(4, 1fr); } }
+		.stat { background: linear-gradient(135deg, #7a1429, #5c0e1e); color: #fff; border-radius: 10px; padding: 18px; }
+		.stat-value { font-size: 26px; font-weight: 800; }
+		.stat-label { font-size: 12px; opacity: 0.85; margin-top: 4px; }
+
+		/* Card */
+		.card { background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+		.card h2 { margin-bottom: 14px; color: #333; font-size: 16px; }
+
+		.search-bar { display: flex; gap: 10px; margin-bottom: 20px; }
+		.search-bar input { flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; }
+
 		.form-row { display: flex; flex-direction: column; gap: 10px; }
 		@media(min-width: 600px) { .form-row { flex-direction: row; } }
-		input[type=text], input[type=number] { padding: 10px; border: 1px solid #ddd; border-radius: 6px; width: 100%%; font-size: 15px; }
-		.btn { padding: 10px 18px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: bold; width: 100%%; }
+		input[type=text], input[type=number] { padding: 10px; border: 1px solid #ddd; border-radius: 6px; width: 100%%; font-size: 14px; }
+
+		.btn { padding: 10px 18px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 700; width: 100%%; }
 		@media(min-width: 600px) { .btn { width: auto; } }
-		.btn-green { background: #4CAF50; color: white; }
-		.btn-red { background: #f44336; color: white; }
-		.btn-blue { background: #2196F3; color: white; }
-		.btn-orange { background: #FF9800; color: white; }
-		.btn-sm { padding: 6px 12px; font-size: 13px; width: auto; }
-		.product-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #eee; gap: 10px; flex-wrap: wrap; }
-		.product-item:last-child { border-bottom: none; }
-		.product-info { flex: 1; }
-		.product-name { font-weight: bold; font-size: 15px; }
-		.product-price { color: #4CAF50; font-size: 14px; margin-top: 2px; }
-		.product-actions { display: flex; gap: 6px; flex-wrap: wrap; }
-		.unavailable { opacity: 0.5; }
-		.unavailable .product-name { text-decoration: line-through; }
-		.order-card { border: 1px solid #eee; border-radius: 8px; padding: 14px; margin-bottom: 12px; background: white; }
-		.order-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 6px; }
-		.order-id { font-weight: bold; font-size: 16px; color: #333; }
-		.badge { padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; }
-		.badge-pending { background: #fff3cd; color: #856404; }
-		.badge-pending_payment { background: #f8d7da; color: #721c24; }
-		.badge-ready { background: #d4edda; color: #155724; }
-		.badge-out_for_delivery { background: #cce5ff; color: #004085; }
-		.badge-completed { background: #e2e3e5; color: #383d41; }
-		.pay-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; margin-left: 6px; }
-		.paid { background: #d4edda; color: #155724; }
-		.unpaid { background: #f8d7da; color: #721c24; }
-		.order-details { font-size: 14px; color: #555; margin-bottom: 10px; line-height: 1.6; }
-		.order-total { font-weight: bold; color: #333; }
-		.delivery-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; margin-left: 6px; }
-		.delivery { background: #e3f2fd; color: #1565c0; }
-		.pickup { background: #e8f5e9; color: #2e7d32; }
-		.status-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-		select { padding: 8px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; flex: 1; }
-		.empty { text-align: center; padding: 30px; color: #888; }
+		.btn-green { background: #1f9d55; color: white; }
+		.btn-red { background: #d63447; color: white; }
+		.btn-blue { background: #2563eb; color: white; }
+		.btn-orange { background: #e07b13; color: white; }
+		.btn-maroon { background: #5c0e1e; color: white; }
+		.btn-sm { padding: 6px 12px; font-size: 12px; width: auto; }
+
+		/* Table style list (products grouped) */
+		.table-wrap { overflow-x: auto; }
+		table.data-table { width: 100%%; border-collapse: collapse; font-size: 13px; }
+		table.data-table th { text-align: left; padding: 10px 12px; background: #f7f1f2; color: #5c0e1e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; border-bottom: 2px solid #eee; white-space: nowrap; }
+		table.data-table td { padding: 10px 12px; border-bottom: 1px solid #f0f0f0; vertical-align: middle; white-space: nowrap; }
+		table.data-table tr:hover td { background: #fafafa; }
+		.cat-pill { display: inline-block; background: #f1e3e5; color: #5c0e1e; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 700; }
+		.row-actions { display: flex; gap: 6px; flex-wrap: nowrap; }
+		.price-edit { display: flex; gap: 4px; align-items: center; }
+		.price-edit input { width: 90px; padding: 6px; font-size: 12px; }
+		.unavailable-row td { opacity: 0.45; }
+		.unavailable-row .prod-name { text-decoration: line-through; }
+
+		.status-pill { padding: 4px 12px; border-radius: 20px; font-size: 11px; font-weight: 700; display: inline-block; }
+		.status-pending, .status-pending_payment { background: #fdecea; color: #c0392b; }
+		.status-ready { background: #e8f8ee; color: #1f9d55; }
+		.status-out_for_delivery { background: #eaf1fe; color: #2563eb; }
+		.status-completed { background: #eee; color: #555; }
+		.pay-pill { padding: 3px 10px; border-radius: 20px; font-size: 10px; font-weight: 700; margin-left: 6px; }
+		.pay-paid { background: #e8f8ee; color: #1f9d55; }
+		.pay-unpaid { background: #fdecea; color: #c0392b; }
+		.delivery-pill { padding: 3px 10px; border-radius: 20px; font-size: 10px; font-weight: 700; }
+		.dp-delivery { background: #eaf1fe; color: #2563eb; }
+		.dp-pickup { background: #e8f8ee; color: #1f9d55; }
+
+		select { padding: 7px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; }
+		.empty { text-align: center; padding: 30px; color: #999; }
 	</style>
 </head>
 <body>
-	<div class="header">
-		<h1>🛒 %s</h1>
-		<a href="/admin/logout" class="logout">Logout</a>
-	</div>
-	<div class="tabs">
-		<a href="/admin" class="tab %s">📦 Products</a>
-		<a href="/admin/orders" class="tab %s">🧾 Orders</a>
-	</div>
-	<div class="container">`, shopName, shopName, productsActive, ordersActive)
+	<div class="shell">
+		<div class="sidebar">
+			<div class="sidebar-brand">%s</div>
+			<div class="sidebar-nav">
+				<a href="/admin" class="nav-item %s"><span class="nav-icon">📊</span> Dashboard</a>
+				<a href="/admin/orders" class="nav-item %s"><span class="nav-icon">🧾</span> Orders</a>
+				<a href="/admin" class="nav-item %s"><span class="nav-icon">📦</span> Products</a>
+				<a href="#" class="nav-item"><span class="nav-icon">🗂️</span> Categories</a>
+				<a href="#" class="nav-item"><span class="nav-icon">🕐</span> Schedule</a>
+				<a href="#" class="nav-item"><span class="nav-icon">🖼️</span> Image Upload</a>
+				<a href="#" class="nav-item"><span class="nav-icon">⚙️</span> Configure</a>
+			</div>
+			<div class="sidebar-help">
+				<strong>Need help?</strong>
+				Contact support for assistance with your store.
+			</div>
+		</div>
+		<div class="main">
+			<div class="topbar">
+				<div class="topbar-tabs">
+					<a href="/admin" class="topbar-tab %s">Products</a>
+					<a href="/admin/orders" class="topbar-tab %s">Orders</a>
+				</div>
+				<div class="topbar-right">
+					<a href="/admin/logout" class="logout-pill">Logout</a>
+				</div>
+			</div>
+			<div class="content">
+				<div class="stats">
+					<div class="stat"><div class="stat-value">%d</div><div class="stat-label">Total Products</div></div>
+					<div class="stat"><div class="stat-value">%d</div><div class="stat-label">Total Orders</div></div>
+					<div class="stat"><div class="stat-value">NGN</div><div class="stat-label">Currency</div></div>
+					<div class="stat"><div class="stat-value">Live</div><div class="stat-label">Bot Status</div></div>
+				</div>`, shopName, shopName, productsActive, ordersActive, productsActive, productsActive, ordersActive, totalProducts, totalOrders)
+}
+
+func adminFooter(w http.ResponseWriter) {
+	fmt.Fprintf(w, `</div></div></div></body></html>`)
 }
 
 // --- Admin products handler ---
@@ -1218,52 +1279,55 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 
 	if len(products) == 0 {
 		fmt.Fprintf(w, `<div class="empty">No products yet. Add your first product above!</div>`)
-	}
+	} else {
+		fmt.Fprintf(w, `<div class="table-wrap"><table class="data-table"><tr><th>S.L</th><th>Product Name</th><th>Category</th><th>Price (NGN)</th><th>Status</th><th>Update Price</th><th>Actions</th></tr>`)
 
-	currentCategory := ""
-	for _, p := range products {
-		if p.Category != currentCategory {
-			if currentCategory != "" {
-				fmt.Fprintf(w, `</div>`)
+		for i, p := range products {
+			rowClass := ""
+			toggleLabel := "Hide"
+			toggleClass := "btn-orange"
+			statusPill := `<span class="status-pill status-ready">Visible</span>`
+			if !p.Available {
+				rowClass = "unavailable-row"
+				toggleLabel = "Show"
+				toggleClass = "btn-green"
+				statusPill = `<span class="status-pill status-pending">Hidden</span>`
 			}
-			currentCategory = p.Category
-			fmt.Fprintf(w, `<div style="margin-top:12px"><strong style="color:#4CAF50">📁 %s</strong></div><div>`, p.Category)
+			fmt.Fprintf(w, `
+			<tr class="%s">
+				<td>%02d</td>
+				<td class="prod-name">%s</td>
+				<td><span class="cat-pill">%s</span></td>
+				<td>NGN %.0f</td>
+				<td>%s</td>
+				<td>
+					<form method="POST" action="/admin" class="price-edit">
+						<input type="hidden" name="action" value="edit_price">
+						<input type="hidden" name="id" value="%d">
+						<input type="number" name="price" placeholder="New price" min="1">
+						<button type="submit" class="btn btn-blue btn-sm">Update</button>
+					</form>
+				</td>
+				<td>
+					<div class="row-actions">
+						<form method="POST" action="/admin">
+							<input type="hidden" name="action" value="toggle_product">
+							<input type="hidden" name="id" value="%d">
+							<button type="submit" class="btn %s btn-sm">%s</button>
+						</form>
+						<form method="POST" action="/admin">
+							<input type="hidden" name="action" value="delete_product">
+							<input type="hidden" name="id" value="%d">
+							<button type="submit" class="btn btn-red btn-sm" onclick="return confirm('Delete this product?')">Delete</button>
+						</form>
+					</div>
+				</td>
+			</tr>`, rowClass, i+1, p.Name, p.Category, p.Price, statusPill, p.ID, p.ID, toggleClass, toggleLabel, p.ID)
 		}
-		availableClass := ""
-		toggleLabel := "Hide"
-		toggleClass := "btn-orange"
-		if !p.Available {
-			availableClass = "unavailable"
-			toggleLabel = "Show"
-			toggleClass = "btn-green"
-		}
-		fmt.Fprintf(w, `
-		<div class="product-item %s">
-			<div class="product-info">
-				<div class="product-name">%s</div>
-				<div class="product-price">NGN %.0f</div>
-			</div>
-			<div class="product-actions">
-				<form method="POST" action="/admin" style="display:flex;gap:6px;align-items:center">
-					<input type="hidden" name="action" value="edit_price">
-					<input type="hidden" name="id" value="%d">
-					<input type="number" name="price" placeholder="New price" min="1" style="width:100px;padding:6px;border:1px solid #ddd;border-radius:6px;font-size:13px">
-					<button type="submit" class="btn btn-blue btn-sm">Update</button>
-				</form>
-				<form method="POST" action="/admin">
-					<input type="hidden" name="action" value="toggle_product">
-					<input type="hidden" name="id" value="%d">
-					<button type="submit" class="btn %s btn-sm">%s</button>
-				</form>
-				<form method="POST" action="/admin">
-					<input type="hidden" name="action" value="delete_product">
-					<input type="hidden" name="id" value="%d">
-					<button type="submit" class="btn btn-red btn-sm" onclick="return confirm('Delete this product?')">Delete</button>
-				</form>
-			</div>
-		</div>`, availableClass, p.Name, p.Price, p.ID, p.ID, toggleClass, toggleLabel, p.ID)
+		fmt.Fprintf(w, `</table></div>`)
 	}
-	fmt.Fprintf(w, `</div></div></div></body></html>`)
+	fmt.Fprintf(w, `</div>`)
+	adminFooter(w)
 }
 
 // --- Admin orders handler ---
@@ -1336,7 +1400,6 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 		<div class="stat"><div class="stat-value">%d</div><div class="stat-label">Pending Orders</div></div>
 		<div class="stat"><div class="stat-value">%d</div><div class="stat-label">Total Orders</div></div>
 	</div>`, totalOrders, totalRevenue, pendingOrders, len(orders))
-
 	clearBtn := ""
 	if search != "" {
 		clearBtn = `<a href="/admin/orders" class="btn btn-red" style="width:auto;padding:10px 18px;text-decoration:none;display:inline-block">Clear</a>`
@@ -1350,62 +1413,76 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 		</form>
 	</div>`, search, clearBtn)
 
-	fmt.Fprintf(w, `<div class="card"><h2>Orders (%d)</h2></div>`, len(orders))
+	fmt.Fprintf(w, `<div class="card"><h2>Orders (%d)</h2>`, len(orders))
 
 	if len(orders) == 0 {
-		fmt.Fprintf(w, `<div class="empty">No orders found</div>`)
+		fmt.Fprintf(w, `<div class="empty">No orders found</div></div>`)
+	} else {
+		fmt.Fprintf(w, `<div class="table-wrap"><table class="data-table"><tr><th>S.L</th><th>Order ID</th><th>Items</th><th>Total</th><th>Type</th><th>Phone</th><th>Time</th><th>Payment</th><th>Status</th><th>Update</th></tr>`)
+
+		for i, o := range orders {
+			deliveryInfo := o.PickupSlot
+			deliveryPill := `<span class="delivery-pill dp-pickup">Pickup</span>`
+			statusOptions := `
+				<option value="pending" ` + selected(o.Status, "pending") + `>Pending</option>
+				<option value="ready" ` + selected(o.Status, "ready") + `>Ready for pickup</option>
+				<option value="completed" ` + selected(o.Status, "completed") + `>Completed</option>`
+
+			if o.DeliveryType == "delivery" {
+				deliveryInfo = o.DeliveryAddress
+				deliveryPill = `<span class="delivery-pill dp-delivery">Delivery</span>`
+				statusOptions = `
+				<option value="pending" ` + selected(o.Status, "pending") + `>Pending</option>
+				<option value="out_for_delivery" ` + selected(o.Status, "out_for_delivery") + `>Out for delivery</option>
+				<option value="completed" ` + selected(o.Status, "completed") + `>Completed</option>`
+			}
+
+			payClass := "pay-unpaid"
+			if o.PaymentStatus == "paid" {
+				payClass = "pay-paid"
+			}
+
+			statusForm := `<span style="color:#999;font-size:12px">Awaiting payment</span>`
+			if o.PaymentStatus == "paid" {
+				statusForm = fmt.Sprintf(`
+				<form method="POST" action="/admin/orders" style="display:flex;gap:6px;align-items:center">
+					<input type="hidden" name="id" value="%s">
+					<select name="status">%s</select>
+					<button type="submit" class="btn btn-maroon btn-sm">Update</button>
+				</form>`, o.OrderID, statusOptions)
+			}
+
+			fmt.Fprintf(w, `
+			<tr>
+				<td>%02d</td>
+				<td><strong>%s</strong> %s</td>
+				<td>%s</td>
+				<td>NGN %.0f</td>
+				<td>%s<br><span style="font-size:11px;color:#888">%s</span></td>
+				<td>%s</td>
+				<td>%s</td>
+				<td><span class="pay-pill %s">%s</span></td>
+				<td><span class="status-pill status-%s">%s</span></td>
+				<td>%s</td>
+			</tr>`,
+				i+1, o.OrderID, deliveryPill, o.Items, o.Total,
+				deliveryInfo, func() string {
+					if o.DeliveryType == "delivery" {
+						return "Delivery"
+					}
+					return "Pickup"
+				}(),
+				o.Phone, o.CreatedAt,
+				payClass, o.PaymentStatus,
+				o.Status, o.Status,
+				statusForm,
+			)
+		}
+		fmt.Fprintf(w, `</table></div></div>`)
 	}
 
-	for _, o := range orders {
-		badgeClass := "badge-" + o.Status
-		deliveryInfo := fmt.Sprintf("🏪 Pickup: %s", o.PickupSlot)
-		deliveryBadge := `<span class="delivery-badge pickup">Pickup</span>`
-		statusOptions := `
-			<option value="pending" ` + selected(o.Status, "pending") + `>Pending</option>
-			<option value="ready" ` + selected(o.Status, "ready") + `>Ready for pickup</option>
-			<option value="completed" ` + selected(o.Status, "completed") + `>Completed</option>`
-
-		if o.DeliveryType == "delivery" {
-			deliveryInfo = fmt.Sprintf("🚚 Deliver to: %s", o.DeliveryAddress)
-			deliveryBadge = `<span class="delivery-badge delivery">Delivery</span>`
-			statusOptions = `
-			<option value="pending" ` + selected(o.Status, "pending") + `>Pending</option>
-			<option value="out_for_delivery" ` + selected(o.Status, "out_for_delivery") + `>Out for delivery</option>
-			<option value="completed" ` + selected(o.Status, "completed") + `>Completed</option>`
-		}
-
-		statusForm := `<p style="color:#999;font-size:13px">⏳ Awaiting payment</p>`
-		if o.PaymentStatus == "paid" {
-			statusForm = fmt.Sprintf(`
-			<form method="POST" action="/admin/orders" class="status-form">
-				<input type="hidden" name="id" value="%s">
-				<select name="status">%s</select>
-				<button type="submit" class="btn btn-green">Update</button>
-			</form>`, o.OrderID, statusOptions)
-		}
-
-		fmt.Fprintf(w, `
-		<div class="order-card">
-			<div class="order-header">
-				<span class="order-id">Order #%s %s <span class="pay-badge %s">%s</span></span>
-				<span class="badge %s">%s</span>
-			</div>
-			<div class="order-details">
-				📱 %s<br>
-				🛍️ %s<br>
-				💰 <span class="order-total">NGN %.0f</span><br>
-				%s<br>
-				📅 %s
-			</div>
-			%s
-		</div>`,
-			o.OrderID, deliveryBadge, o.PaymentStatus, o.PaymentStatus,
-			badgeClass, o.Status,
-			o.Phone, o.Items, o.Total, deliveryInfo, o.CreatedAt,
-			statusForm,
-		)
-	}
-	fmt.Fprintf(w, `</div></body></html>`)
+	fmt.Fprintf(w, `</div>`)
+	adminFooter(w)
 }
 
 func selected(current, value string) string {
