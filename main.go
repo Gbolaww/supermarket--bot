@@ -3,13 +3,16 @@ package main
 import (
 	"bytes"
 	"crypto/hmac"
+	"crypto/sha1"
 	"crypto/sha512"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -28,6 +31,7 @@ type Product struct {
 	Price     float64
 	Category  string
 	Available bool
+	ImageURL  string
 }
 
 type CartItem struct {
@@ -114,6 +118,7 @@ func initDB() {
 	db.Exec(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'unpaid'`)
 	db.Exec(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS paystack_ref TEXT DEFAULT ''`)
 	db.Exec(`ALTER TABLE products ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'General'`)
+	db.Exec(`ALTER TABLE products ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT ''`)
 	db.Exec(`UPDATE orders SET payment_status = 'paid', status = 'pending' WHERE payment_status IS NULL OR payment_status = ''`)
 
 	log.Println("✅ Database ready")
@@ -159,7 +164,7 @@ func closedMessage() string {
 // --- Product helpers ---
 
 func getProducts() ([]Product, error) {
-	rows, err := db.Query(`SELECT id, name, price, category, available FROM products WHERE available = true ORDER BY category, id`)
+	rows, err := db.Query(`SELECT id, name, price, category, available, image_url FROM products WHERE available = true ORDER BY category, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -167,14 +172,14 @@ func getProducts() ([]Product, error) {
 	var products []Product
 	for rows.Next() {
 		var p Product
-		rows.Scan(&p.ID, &p.Name, &p.Price, &p.Category, &p.Available)
+		rows.Scan(&p.ID, &p.Name, &p.Price, &p.Category, &p.Available, &p.ImageURL)
 		products = append(products, p)
 	}
 	return products, nil
 }
 
 func getAllProducts() ([]Product, error) {
-	rows, err := db.Query(`SELECT id, name, price, category, available FROM products ORDER BY category, id`)
+	rows, err := db.Query(`SELECT id, name, price, category, available, image_url FROM products ORDER BY category, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +187,7 @@ func getAllProducts() ([]Product, error) {
 	var products []Product
 	for rows.Next() {
 		var p Product
-		rows.Scan(&p.ID, &p.Name, &p.Price, &p.Category, &p.Available)
+		rows.Scan(&p.ID, &p.Name, &p.Price, &p.Category, &p.Available, &p.ImageURL)
 		products = append(products, p)
 	}
 	return products, nil
@@ -204,7 +209,7 @@ func getCategories() ([]string, error) {
 }
 
 func getProductsByCategory(category string) ([]Product, error) {
-	rows, err := db.Query(`SELECT id, name, price, category, available FROM products WHERE available = true AND category = $1 ORDER BY id`, category)
+	rows, err := db.Query(`SELECT id, name, price, category, available, image_url FROM products WHERE available = true AND category = $1 ORDER BY id`, category)
 	if err != nil {
 		return nil, err
 	}
@@ -212,7 +217,7 @@ func getProductsByCategory(category string) ([]Product, error) {
 	var products []Product
 	for rows.Next() {
 		var p Product
-		rows.Scan(&p.ID, &p.Name, &p.Price, &p.Category, &p.Available)
+		rows.Scan(&p.ID, &p.Name, &p.Price, &p.Category, &p.Available, &p.ImageURL)
 		products = append(products, p)
 	}
 	return products, nil
@@ -292,6 +297,83 @@ func sendWhatsAppMessage(to, body string) error {
 		return sendMetaMessage(to, body)
 	}
 	return sendTwilioMessage(to, body)
+}
+
+func sendWhatsAppImage(to, imageURL, caption string) error {
+	if useMetaAPI() {
+		return sendMetaImage(to, imageURL, caption)
+	}
+	return sendTwilioImage(to, imageURL, caption)
+}
+
+func sendTwilioImage(to, imageURL, caption string) error {
+	accountSID := os.Getenv("TWILIO_ACCOUNT_SID")
+	authToken := os.Getenv("TWILIO_AUTH_TOKEN")
+	fromNumber := os.Getenv("TWILIO_WHATSAPP_NUMBER")
+
+	apiURL := fmt.Sprintf("https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json", accountSID)
+	msgData := url.Values{}
+	msgData.Set("To", "whatsapp:"+to)
+	msgData.Set("From", fromNumber)
+	msgData.Set("Body", caption)
+	msgData.Set("MediaUrl", imageURL)
+
+	client := &http.Client{}
+	req, err := http.NewRequest("POST", apiURL, strings.NewReader(msgData.Encode()))
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(accountSID, authToken)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("twilio error: %s", resp.Status)
+	}
+	return nil
+}
+
+func sendMetaImage(to, imageURL, caption string) error {
+	accessToken := os.Getenv("META_ACCESS_TOKEN")
+	phoneNumberID := os.Getenv("META_PHONE_NUMBER_ID")
+
+	apiURL := fmt.Sprintf("https://graph.facebook.com/v18.0/%s/messages", phoneNumberID)
+
+	payload := map[string]interface{}{
+		"messaging_product": "whatsapp",
+		"to":                to,
+		"type":              "image",
+		"image": map[string]string{
+			"link":    imageURL,
+			"caption": caption,
+		},
+	}
+
+	payloadBytes, _ := json.Marshal(payload)
+	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(payloadBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("meta error: %s - %s", resp.Status, string(body))
+	}
+	return nil
 }
 
 func sendTwilioMessage(to, body string) error {
@@ -409,6 +491,70 @@ func notifyCustomer(phone, orderID, status string) {
 }
 
 // --- Paystack helpers ---
+
+// --- Cloudinary helpers ---
+
+func sha1Hex(s string) string {
+	h := sha1.New()
+	h.Write([]byte(s))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func uploadToCloudinary(file multipart.File, filename string) (string, error) {
+	cloudName := os.Getenv("CLOUDINARY_CLOUD_NAME")
+	apiKey := os.Getenv("CLOUDINARY_API_KEY")
+	apiSecret := os.Getenv("CLOUDINARY_API_SECRET")
+
+	timestamp := fmt.Sprintf("%d", time.Now().Unix())
+
+	// Cloudinary signed uploads use SHA-1 over the params-to-sign string + api secret
+	signString := fmt.Sprintf("timestamp=%s%s", timestamp, apiSecret)
+	signature := sha1Hex(signString)
+
+	var b bytes.Buffer
+	writer := multipart.NewWriter(&b)
+
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(part, file); err != nil {
+		return "", err
+	}
+
+	writer.WriteField("timestamp", timestamp)
+	writer.WriteField("api_key", apiKey)
+	writer.WriteField("signature", signature)
+	writer.Close()
+
+	uploadURL := fmt.Sprintf("https://api.cloudinary.com/v1_1/%s/image/upload", cloudName)
+	req, err := http.NewRequest("POST", uploadURL, &b)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		SecureURL string `json:"secure_url"`
+		Error     struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	if result.SecureURL == "" {
+		return "", fmt.Errorf("cloudinary upload failed: %s", result.Error.Message)
+	}
+	return result.SecureURL, nil
+}
 
 func createPaystackPaymentLink(orderID, phone string, totalKobo int) (string, error) {
 	secretKey := os.Getenv("PAYSTACK_SECRET_KEY")
@@ -660,6 +806,9 @@ func handleMessage(from, message string) string {
 			if messageLower == fmt.Sprintf("%d", i+1) {
 				session.State = "QUANTITY"
 				session.Cart = append(session.Cart, CartItem{Product: p, Quantity: 0})
+				if p.ImageURL != "" {
+					go sendWhatsAppImage(from, p.ImageURL, fmt.Sprintf("%s — NGN %.0f", p.Name, p.Price))
+				}
 				return fmt.Sprintf("How many of *%s* would you like?\n\nReply with a number or type *back* to go back.", p.Name)
 			}
 		}
@@ -1220,7 +1369,7 @@ func adminFooter(w http.ResponseWriter) {
 
 func adminHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
-		r.ParseForm()
+		r.ParseMultipartForm(10 << 20) // 10MB max
 		action := r.FormValue("action")
 		switch action {
 		case "clear_all_products":
@@ -1233,8 +1382,19 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 			if category == "" {
 				category = "General"
 			}
+			imageURL := ""
+			file, header, err := r.FormFile("image")
+			if err == nil {
+				defer file.Close()
+				uploadedURL, uploadErr := uploadToCloudinary(file, header.Filename)
+				if uploadErr != nil {
+					log.Printf("Cloudinary upload error: %v", uploadErr)
+				} else {
+					imageURL = uploadedURL
+				}
+			}
 			if name != "" && price > 0 {
-				db.Exec(`INSERT INTO products (name, price, category) VALUES ($1, $2, $3)`, name, price, category)
+				db.Exec(`INSERT INTO products (name, price, category, image_url) VALUES ($1, $2, $3, $4)`, name, price, category, imageURL)
 			}
 		case "delete_product":
 			id := r.FormValue("id")
@@ -1249,6 +1409,18 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 			if price > 0 {
 				db.Exec(`UPDATE products SET price = $1 WHERE id = $2`, price, id)
 			}
+		case "upload_image":
+			id := r.FormValue("id")
+			file, header, err := r.FormFile("image")
+			if err == nil {
+				defer file.Close()
+				uploadedURL, uploadErr := uploadToCloudinary(file, header.Filename)
+				if uploadErr != nil {
+					log.Printf("Cloudinary upload error: %v", uploadErr)
+				} else {
+					db.Exec(`UPDATE products SET image_url = $1 WHERE id = $2`, uploadedURL, id)
+				}
+			}
 		}
 		http.Redirect(w, r, "/admin", http.StatusSeeOther)
 		return
@@ -1261,16 +1433,19 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `
 	<div class="card">
 		<h2>Add New Product</h2>
-		<form method="POST" action="/admin">
+		<form method="POST" action="/admin" enctype="multipart/form-data">
 			<input type="hidden" name="action" value="add_product">
 			<div class="form-row">
 				<input type="text" name="name" placeholder="Product name e.g. Rice (5kg)" required>
 				<input type="number" name="price" placeholder="Price in NGN" min="1" required>
 				<input type="text" name="category" placeholder="Category e.g. Grains">
+				<input type="file" name="image" accept="image/*">
 				<button type="submit" class="btn btn-green">+ Add</button>
 			</div>
 		</form>
-	</div>
+	</div>`)
+
+	fmt.Fprintf(w, `
 	<div class="card">
 		<h2>All Products (%d)</h2>
 		<form method="POST" action="/admin" style="margin-bottom:14px">
@@ -1281,7 +1456,7 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 	if len(products) == 0 {
 		fmt.Fprintf(w, `<div class="empty">No products yet. Add your first product above!</div>`)
 	} else {
-		fmt.Fprintf(w, `<div class="table-wrap"><table class="data-table"><tr><th>S.L</th><th>Product Name</th><th>Category</th><th>Price (NGN)</th><th>Status</th><th>Update Price</th><th>Actions</th></tr>`)
+		fmt.Fprintf(w, `<div class="table-wrap"><table class="data-table"><tr><th>S.L</th><th>Image</th><th>Product Name</th><th>Category</th><th>Price (NGN)</th><th>Status</th><th>Update Price</th><th>Actions</th></tr>`)
 
 		for i, p := range products {
 			rowClass := ""
@@ -1294,9 +1469,22 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 				toggleClass = "btn-green"
 				statusPill = `<span class="status-pill status-pending">Hidden</span>`
 			}
+			imageCell := `<span style="color:#bbb;font-size:11px">No image</span>`
+			if p.ImageURL != "" {
+				imageCell = fmt.Sprintf(`<img src="%s" style="width:42px;height:42px;object-fit:cover;border-radius:6px">`, p.ImageURL)
+			}
+
 			fmt.Fprintf(w, `
 			<tr class="%s">
 				<td>%02d</td>
+				<td>
+					%s
+					<form method="POST" action="/admin" enctype="multipart/form-data" style="margin-top:4px">
+						<input type="hidden" name="action" value="upload_image">
+						<input type="hidden" name="id" value="%d">
+						<input type="file" name="image" accept="image/*" style="font-size:10px;width:90px" onchange="this.form.submit()">
+					</form>
+				</td>
 				<td class="prod-name">%s</td>
 				<td><span class="cat-pill">%s</span></td>
 				<td>NGN %.0f</td>
@@ -1323,7 +1511,7 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 						</form>
 					</div>
 				</td>
-			</tr>`, rowClass, i+1, p.Name, p.Category, p.Price, statusPill, p.ID, p.ID, toggleClass, toggleLabel, p.ID)
+			</tr>`, rowClass, i+1, imageCell, p.ID, p.Name, p.Category, p.Price, statusPill, p.ID, p.ID, toggleClass, toggleLabel, p.ID)
 		}
 		fmt.Fprintf(w, `</table></div>`)
 	}
