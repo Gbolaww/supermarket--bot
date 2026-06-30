@@ -493,6 +493,7 @@ func showLoginPage(w http.ResponseWriter, errMsg string) {
 	if errMsg != "" {
 		errHTML = fmt.Sprintf(`<div class="error">%s</div>`, errMsg)
 	}
+	logoLetter := strings.ToUpper(string([]rune(shopName)[0]))
 	w.Header().Set("Content-Type", "text/html")
 	fmt.Fprintf(w, `<!DOCTYPE html>
 <html>
@@ -503,7 +504,7 @@ func showLoginPage(w http.ResponseWriter, errMsg string) {
 		* { box-sizing: border-box; margin: 0; padding: 0; }
 		body { font-family: Arial, sans-serif; background: #f5f5f5; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
 		.login-card { background: white; border-radius: 12px; padding: 32px; width: 100%%; max-width: 380px; margin: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-		.logo { text-align: center; font-size: 40px; margin-bottom: 10px; }
+		.logo { width: 56px; height: 56px; margin: 0 auto 14px; background: #5c0e1e; color: #fff; border-radius: 50%%; display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: 800; }
 		h1 { text-align: center; color: #333; font-size: 20px; margin-bottom: 6px; }
 		p { text-align: center; color: #888; font-size: 14px; margin-bottom: 24px; }
 		input[type=password] { width: 100%%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 15px; margin-bottom: 14px; }
@@ -513,7 +514,7 @@ func showLoginPage(w http.ResponseWriter, errMsg string) {
 </head>
 <body>
 	<div class="login-card">
-		<div class="logo">🛒</div>
+		<div class="logo">%s</div>
 		<h1>%s</h1>
 		<p>Admin Dashboard</p>
 		%s
@@ -523,7 +524,7 @@ func showLoginPage(w http.ResponseWriter, errMsg string) {
 		</form>
 	</div>
 </body>
-</html>`, shopName, shopName, errHTML)
+</html>`, shopName, logoLetter, shopName, errHTML)
 }
 
 // --- Bot logic ---
