@@ -1071,18 +1071,6 @@ func adminHeader(w http.ResponseWriter, activeTab string) {
 	if shopName == "" {
 		shopName = "Supermarket"
 	}
-	productsActive := ""
-	ordersActive := ""
-	if activeTab == "products" {
-		productsActive = "active"
-	} else {
-		ordersActive = "active"
-	}
-func adminHeader(w http.ResponseWriter, activeTab string) {
-	shopName := os.Getenv("SHOP_NAME")
-	if shopName == "" {
-		shopName = "Supermarket"
-	}
 
 	var totalProducts, totalOrders int
 	db.QueryRow(`SELECT COUNT(*) FROM products`).Scan(&totalProducts)
