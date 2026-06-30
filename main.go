@@ -1161,6 +1161,8 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 		r.ParseForm()
 		action := r.FormValue("action")
 		switch action {
+		case "clear_all_products":
+			db.Exec(`DELETE FROM products`)
 		case "add_product":
 			name := r.FormValue("name")
 			price := 0.0
@@ -1208,7 +1210,11 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 		</form>
 	</div>
 	<div class="card">
-		<h2>All Products (%d)</h2>`, len(products))
+		<h2>All Products (%d)</h2>
+		<form method="POST" action="/admin" style="margin-bottom:14px">
+			<input type="hidden" name="action" value="clear_all_products">
+			<button type="submit" class="btn btn-red" onclick="return confirm('This will permanently delete ALL products. Are you sure?')">🗑️ Clear All Products</button>
+		</form>`, len(products))
 
 	if len(products) == 0 {
 		fmt.Fprintf(w, `<div class="empty">No products yet. Add your first product above!</div>`)
