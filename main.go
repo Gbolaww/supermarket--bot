@@ -265,7 +265,7 @@ func getOrdersByPhone(phone string) ([]string, error) {
 		if paymentStatus == "paid" {
 			payIcon = "✅ paid"
 		}
-		lines = append(lines, fmt.Sprintf("• *%s* — %s\n  ₦%.0f | %s | %s | _%s_", orderID, items, total, delivery, payIcon, status))
+		lines = append(lines, fmt.Sprintf("• *%s* — %s\n  NGN %.0f | %s | %s | _%s_", orderID, items, total, delivery, payIcon, status))
 	}
 	return lines, nil
 }
@@ -372,7 +372,7 @@ func notifyAdmin(orderID, phone, items string, total float64, session *Session) 
 		deliveryInfo = fmt.Sprintf("Delivery to: %s", session.DeliveryAddress)
 	}
 	msg := fmt.Sprintf(
-		"🔔 *New Paid Order - %s*\n\nOrder ID: *%s*\nCustomer: %s\nItems: %s\nTotal: ₦%.0f\n%s\n\nUpdate status at: %s/admin/orders",
+		"🔔 *New Paid Order - %s*\n\nOrder ID: *%s*\nCustomer: %s\nItems: %s\nTotal: NGN %.0f\n%s\n\nUpdate status at: %s/admin/orders",
 		shopName, orderID, phone, items, total, deliveryInfo,
 		os.Getenv("RAILWAY_PUBLIC_DOMAIN"),
 	)
@@ -559,7 +559,7 @@ func handleMessage(from, message string) string {
 			if paymentStatus == "unpaid" {
 				payInfo = "\n⚠️ *Payment pending* — please complete payment to confirm your order."
 			}
-			return fmt.Sprintf("📦 *Order #%s*\n\nItems: %s\nTotal: ₦%.0f\nStatus: %s *%s*%s", orderID, items, total, statusEmoji, strings.ToUpper(status), payInfo)
+			return fmt.Sprintf("📦 *Order #%s*\n\nItems: %s\nTotal: NGN %.0f\nStatus: %s *%s*%s", orderID, items, total, statusEmoji, strings.ToUpper(status), payInfo)
 		}
 	}
 
@@ -807,7 +807,7 @@ func buildCatalogMessage(products []Product) string {
 	var sb strings.Builder
 	sb.WriteString("🛒 *Products:*\n\n")
 	for i, p := range products {
-		sb.WriteString(fmt.Sprintf("%d. %s — ₦%.0f\n", i+1, p.Name, p.Price))
+		sb.WriteString(fmt.Sprintf("%d. %s — NGN %.0f\n", i+1, p.Name, p.Price))
 	}
 	sb.WriteString("\nReply with the *number* of the item you want.\nType *done* to checkout or *back* to go back.")
 	return sb.String()
@@ -819,10 +819,10 @@ func buildCartMessage(session *Session) string {
 	total := 0.0
 	for i, item := range session.Cart {
 		subtotal := item.Product.Price * float64(item.Quantity)
-		sb.WriteString(fmt.Sprintf("%d. %s x%d — ₦%.0f\n", i+1, item.Product.Name, item.Quantity, subtotal))
+		sb.WriteString(fmt.Sprintf("%d. %s x%d — NGN %.0f\n", i+1, item.Product.Name, item.Quantity, subtotal))
 		total += subtotal
 	}
-	sb.WriteString(fmt.Sprintf("\n*Subtotal: ₦%.0f*", total))
+	sb.WriteString(fmt.Sprintf("\n*Subtotal: NGN %.0f*", total))
 	sb.WriteString("\n\nType *done* to checkout, *remove* to remove an item, or continue shopping.")
 	return sb.String()
 }
@@ -838,7 +838,7 @@ func buildCartRemoveMessage(session *Session) string {
 }
 
 func buildDeliveryTypeMessage() string {
-	return fmt.Sprintf("🚚 *How would you like to receive your order?*\n\n1. 🏪 Pickup (Free)\n2. 🚚 Delivery (+₦%.0f)\n\nReply *1* or *2*.\nType *back* to go back.", DeliveryFee)
+	return fmt.Sprintf("🚚 *How would you like to receive your order?*\n\n1. 🏪 Pickup (Free)\n2. 🚚 Delivery (+NGN %.0f)\n\nReply *1* or *2*.\nType *back* to go back.", DeliveryFee)
 }
 
 func buildPickupMessage() string {
@@ -857,17 +857,17 @@ func buildOrderSummary(s *Session) string {
 	subtotal := 0.0
 	for _, item := range s.Cart {
 		itemTotal := item.Product.Price * float64(item.Quantity)
-		sb.WriteString(fmt.Sprintf("• %s x%d — ₦%.0f\n", item.Product.Name, item.Quantity, itemTotal))
+		sb.WriteString(fmt.Sprintf("• %s x%d — NGN %.0f\n", item.Product.Name, item.Quantity, itemTotal))
 		subtotal += itemTotal
 	}
-	sb.WriteString(fmt.Sprintf("\nSubtotal: ₦%.0f", subtotal))
+	sb.WriteString(fmt.Sprintf("\nSubtotal: NGN %.0f", subtotal))
 	if s.DeliveryType == "delivery" {
-		sb.WriteString(fmt.Sprintf("\nDelivery fee: ₦%.0f", DeliveryFee))
-		sb.WriteString(fmt.Sprintf("\n*Total: ₦%.0f*", subtotal+DeliveryFee))
+		sb.WriteString(fmt.Sprintf("\nDelivery fee: NGN %.0f", DeliveryFee))
+		sb.WriteString(fmt.Sprintf("\n*Total: NGN %.0f*", subtotal+DeliveryFee))
 		sb.WriteString(fmt.Sprintf("\n\n📍 Deliver to: %s", s.DeliveryAddress))
 		sb.WriteString("\n⏱️ Estimated time: 30 minutes")
 	} else {
-		sb.WriteString(fmt.Sprintf("\n*Total: ₦%.0f*", subtotal))
+		sb.WriteString(fmt.Sprintf("\n*Total: NGN %.0f*", subtotal))
 		sb.WriteString(fmt.Sprintf("\n\n🏪 Pickup: %s", s.Pickup))
 	}
 	sb.WriteString("\n\nReply *yes* to proceed to payment, *no* to cancel, or *back* to make changes.")
@@ -1174,7 +1174,7 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		case "delete_product":
 			id := r.FormValue("id")
-			db.Exec(`UPDATE products SET available = false WHERE id = $1`, id)
+			db.Exec(`DELETE FROM products WHERE id = $1`, id)
 		case "toggle_product":
 			id := r.FormValue("id")
 			db.Exec(`UPDATE products SET available = NOT available WHERE id = $1`, id)
@@ -1201,7 +1201,7 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 			<input type="hidden" name="action" value="add_product">
 			<div class="form-row">
 				<input type="text" name="name" placeholder="Product name e.g. Rice (5kg)" required>
-				<input type="number" name="price" placeholder="Price in ₦" min="1" required>
+				<input type="number" name="price" placeholder="Price in NGN" min="1" required>
 				<input type="text" name="category" placeholder="Category e.g. Grains">
 				<button type="submit" class="btn btn-green">+ Add</button>
 			</div>
@@ -1235,7 +1235,7 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 		<div class="product-item %s">
 			<div class="product-info">
 				<div class="product-name">%s</div>
-				<div class="product-price">₦%.0f</div>
+				<div class="product-price">NGN %.0f</div>
 			</div>
 			<div class="product-actions">
 				<form method="POST" action="/admin" style="display:flex;gap:6px;align-items:center">
@@ -1326,7 +1326,7 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `
 	<div class="stats">
 		<div class="stat"><div class="stat-value">%d</div><div class="stat-label">Today's Orders</div></div>
-		<div class="stat"><div class="stat-value">₦%.0f</div><div class="stat-label">Today's Revenue</div></div>
+		<div class="stat"><div class="stat-value">NGN %.0f</div><div class="stat-label">Today's Revenue</div></div>
 		<div class="stat"><div class="stat-value">%d</div><div class="stat-label">Pending Orders</div></div>
 		<div class="stat"><div class="stat-value">%d</div><div class="stat-label">Total Orders</div></div>
 	</div>`, totalOrders, totalRevenue, pendingOrders, len(orders))
@@ -1387,7 +1387,7 @@ func adminOrdersHandler(w http.ResponseWriter, r *http.Request) {
 			<div class="order-details">
 				📱 %s<br>
 				🛍️ %s<br>
-				💰 <span class="order-total">₦%.0f</span><br>
+				💰 <span class="order-total">NGN %.0f</span><br>
 				%s<br>
 				📅 %s
 			</div>
