@@ -675,7 +675,7 @@ func showLoginPage(w http.ResponseWriter, errMsg string) {
 
 // --- Bot logic ---
 
-func handleMessage(from, message string) string {
+func handleMessage(from, message string) (string, string) {
 	shopName := os.Getenv("SHOP_NAME")
 	if shopName == "" {
 		shopName = "our store"
@@ -689,7 +689,7 @@ func handleMessage(from, message string) string {
 			orderID := strings.ToUpper(parts[1])
 			_, items, status, paymentStatus, total, err := getOrderStatus(orderID)
 			if err != nil {
-				return fmt.Sprintf("❌ Order *#%s* not found. Please check the order ID and try again.", orderID)
+				return fmt.Sprintf("❌ Order *#%s* not found. Please check the order ID and try again.", orderID), ""
 			}
 			statusEmoji := "⏳"
 			switch status {
@@ -706,14 +706,14 @@ func handleMessage(from, message string) string {
 			if paymentStatus == "unpaid" {
 				payInfo = "\n⚠️ *Payment pending* — please complete payment to confirm your order."
 			}
-			return fmt.Sprintf("📦 *Order #%s*\n\nItems: %s\nTotal: NGN %.0f\nStatus: %s *%s*%s", orderID, items, total, statusEmoji, strings.ToUpper(status), payInfo)
+			return fmt.Sprintf("📦 *Order #%s*\n\nItems: %s\nTotal: NGN %.0f\nStatus: %s *%s*%s", orderID, items, total, statusEmoji, strings.ToUpper(status), payInfo), ""
 		}
 	}
 
 	if messageLower == "orders" || messageLower == "my orders" {
 		orders, err := getOrdersByPhone(from)
 		if err != nil || len(orders) == 0 {
-			return "You have no past orders. Send *hi* to start ordering!"
+			return "You have no past orders. Send *hi* to start ordering!", ""
 		}
 		var sb strings.Builder
 		sb.WriteString("📦 *Your Recent Orders:*\n\n")
@@ -721,13 +721,13 @@ func handleMessage(from, message string) string {
 			sb.WriteString(o + "\n\n")
 		}
 		sb.WriteString("To track an order, type *track ORDERID* e.g. track A3KX\n\nSend *hi* to place a new order.")
-		return sb.String()
+		return sb.String(), ""
 	}
 
 	session, exists := sessions[from]
 	if !exists || messageLower == "hi" || messageLower == "hello" || messageLower == "start" {
 		if !isOpen() {
-			return closedMessage()
+			return closedMessage(), ""
 		}
 		sessions[from] = &Session{State: "GREETING"}
 		session = sessions[from]
@@ -740,28 +740,28 @@ func handleMessage(from, message string) string {
 				session.Cart = session.Cart[:len(session.Cart)-1]
 			}
 			session.State = "BROWSING"
-			return fmt.Sprintf("↩️ Went back!\n\n%s", buildBrowsingMessage(session))
+			return fmt.Sprintf("↩️ Went back!\n\n%s", buildBrowsingMessage(session)), ""
 		case "REMOVE_ITEM":
 			session.State = "BROWSING"
-			return fmt.Sprintf("↩️ Went back!\n\n%s", buildBrowsingMessage(session))
+			return fmt.Sprintf("↩️ Went back!\n\n%s", buildBrowsingMessage(session)), ""
 		case "DELIVERY_TYPE":
 			session.State = "BROWSING"
-			return fmt.Sprintf("↩️ Went back!\n\n%s", buildBrowsingMessage(session))
+			return fmt.Sprintf("↩️ Went back!\n\n%s", buildBrowsingMessage(session)), ""
 		case "DELIVERY_ADDRESS":
 			session.State = "DELIVERY_TYPE"
-			return fmt.Sprintf("↩️ Went back!\n\n%s", buildDeliveryTypeMessage())
+			return fmt.Sprintf("↩️ Went back!\n\n%s", buildDeliveryTypeMessage()), ""
 		case "PICKUP":
 			session.State = "DELIVERY_TYPE"
-			return fmt.Sprintf("↩️ Went back!\n\n%s", buildDeliveryTypeMessage())
+			return fmt.Sprintf("↩️ Went back!\n\n%s", buildDeliveryTypeMessage()), ""
 		case "CONFIRM":
 			if session.DeliveryType == "delivery" {
 				session.State = "DELIVERY_ADDRESS"
-				return "↩️ Went back!\n\nPlease enter your delivery address:\n\nOr type *back* to go back."
+				return "↩️ Went back!\n\nPlease enter your delivery address:\n\nOr type *back* to go back.", ""
 			}
 			session.State = "PICKUP"
-			return fmt.Sprintf("↩️ Went back!\n\n%s", buildPickupMessage())
+			return fmt.Sprintf("↩️ Went back!\n\n%s", buildPickupMessage()), ""
 		default:
-			return "Nothing to go back to. Send *hi* to start a new order."
+			return "Nothing to go back to. Send *hi* to start a new order.", ""
 		}
 	}
 
@@ -771,19 +771,19 @@ func handleMessage(from, message string) string {
 		categories, _ := getCategories()
 		if isReturningCustomer(from) {
 			if len(categories) > 1 {
-				return fmt.Sprintf("👋 Welcome back to *%s*!\n\n%s", shopName, buildCategoryMessage(categories))
+				return fmt.Sprintf("👋 Welcome back to *%s*!\n\n%s", shopName, buildCategoryMessage(categories)), ""
 			}
 			products, _ := getProducts()
-			return fmt.Sprintf("👋 Welcome back to *%s*!\n\n%s", shopName, buildCatalogMessage(products))
+			return fmt.Sprintf("👋 Welcome back to *%s*!\n\n%s", shopName, buildCatalogMessage(products)), ""
 		}
 		if len(categories) > 1 {
-			return fmt.Sprintf("👋 Welcome to *%s*! We're glad to have you.\n\n%s", shopName, buildCategoryMessage(categories))
+			return fmt.Sprintf("👋 Welcome to *%s*! We're glad to have you.\n\n%s", shopName, buildCategoryMessage(categories)), ""
 		}
 		products, _ := getProducts()
 		if len(products) == 0 {
-			return "Sorry, our catalog is currently unavailable. Please try again later."
+			return "Sorry, our catalog is currently unavailable. Please try again later.", ""
 		}
-		return fmt.Sprintf("👋 Welcome to *%s*! We're glad to have you.\n\n%s", shopName, buildCatalogMessage(products))
+		return fmt.Sprintf("👋 Welcome to *%s*! We're glad to have you.\n\n%s", shopName, buildCatalogMessage(products)), ""
 
 	case "BROWSING":
 		categories, _ := getCategories()
@@ -792,7 +792,7 @@ func handleMessage(from, message string) string {
 				if messageLower == fmt.Sprintf("%d", i+1) || messageLower == strings.ToLower(cat) {
 					session.BrowsingCategory = cat
 					products, _ := getProductsByCategory(cat)
-					return buildCatalogMessage(products)
+					return buildCatalogMessage(products), ""
 				}
 			}
 		}
@@ -806,84 +806,82 @@ func handleMessage(from, message string) string {
 			if messageLower == fmt.Sprintf("%d", i+1) {
 				session.State = "QUANTITY"
 				session.Cart = append(session.Cart, CartItem{Product: p, Quantity: 0})
-				if p.ImageURL != "" {
-					go sendWhatsAppImage(from, p.ImageURL, fmt.Sprintf("%s — NGN %.0f", p.Name, p.Price))
-				}
-				return fmt.Sprintf("How many of *%s* would you like?\n\nReply with a number or type *back* to go back.", p.Name)
+				reply := fmt.Sprintf("How many of *%s* would you like?\n\nReply with a number or type *back* to go back.", p.Name)
+				return reply, p.ImageURL
 			}
 		}
 		if messageLower == "remove" || messageLower == "remove item" {
 			if len(session.Cart) == 0 {
-				return "Your cart is empty. Nothing to remove."
+				return "Your cart is empty. Nothing to remove.", ""
 			}
 			session.State = "REMOVE_ITEM"
-			return buildCartRemoveMessage(session)
+			return buildCartRemoveMessage(session), ""
 		}
 		if messageLower == "done" || messageLower == "checkout" {
 			if len(session.Cart) == 0 {
-				return "Your cart is empty. Please select at least one item."
+				return "Your cart is empty. Please select at least one item.", ""
 			}
 			session.State = "DELIVERY_TYPE"
-			return buildDeliveryTypeMessage()
+			return buildDeliveryTypeMessage(), ""
 		}
 		if messageLower == "cart" || messageLower == "view cart" {
 			if len(session.Cart) == 0 {
-				return "Your cart is empty.\n\n" + buildBrowsingMessage(session)
+				return "Your cart is empty.\n\n" + buildBrowsingMessage(session), ""
 			}
-			return buildCartMessage(session)
+			return buildCartMessage(session), ""
 		}
-		return "Please reply with a number from the menu.\n\nType *done* to checkout, *cart* to view cart, *remove* to remove an item, or *back* to go back."
+		return "Please reply with a number from the menu.\n\nType *done* to checkout, *cart* to view cart, *remove* to remove an item, or *back* to go back.", ""
 
 	case "REMOVE_ITEM":
 		idx := 0
 		fmt.Sscanf(messageLower, "%d", &idx)
 		if idx < 1 || idx > len(session.Cart) {
-			return fmt.Sprintf("Please enter a number between 1 and %d.\n\nOr type *back* to go back.", len(session.Cart))
+			return fmt.Sprintf("Please enter a number between 1 and %d.\n\nOr type *back* to go back.", len(session.Cart)), ""
 		}
 		removed := session.Cart[idx-1].Product.Name
 		session.Cart = append(session.Cart[:idx-1], session.Cart[idx:]...)
 		session.State = "BROWSING"
-		return fmt.Sprintf("✅ *%s* removed!\n\n%s", removed, buildBrowsingMessage(session))
+		return fmt.Sprintf("✅ *%s* removed!\n\n%s", removed, buildBrowsingMessage(session)), ""
 
 	case "QUANTITY":
 		qty := 0
 		fmt.Sscanf(messageLower, "%d", &qty)
 		if qty <= 0 {
-			return "Please enter a valid quantity (e.g. 1, 2, 3...)\n\nOr type *back* to go back."
+			return "Please enter a valid quantity (e.g. 1, 2, 3...)\n\nOr type *back* to go back.", ""
 		}
 		session.Cart[len(session.Cart)-1].Quantity = qty
 		session.State = "BROWSING"
-		return fmt.Sprintf("✅ Added!\n\n%s", buildBrowsingMessage(session))
+		return fmt.Sprintf("✅ Added!\n\n%s", buildBrowsingMessage(session)), ""
 
 	case "DELIVERY_TYPE":
 		if messageLower == "1" || messageLower == "pickup" {
 			session.DeliveryType = "pickup"
 			session.State = "PICKUP"
-			return buildPickupMessage()
+			return buildPickupMessage(), ""
 		} else if messageLower == "2" || messageLower == "delivery" {
 			session.DeliveryType = "delivery"
 			session.State = "DELIVERY_ADDRESS"
-			return "📍 Please enter your delivery address:\n\nOr type *back* to go back."
+			return "📍 Please enter your delivery address:\n\nOr type *back* to go back.", ""
 		}
-		return "Please reply *1* for Pickup or *2* for Delivery.\n\nOr type *back* to go back."
+		return "Please reply *1* for Pickup or *2* for Delivery.\n\nOr type *back* to go back.", ""
 
 	case "DELIVERY_ADDRESS":
 		if len(message) < 5 {
-			return "Please enter a valid address (at least 5 characters).\n\nOr type *back* to go back."
+			return "Please enter a valid address (at least 5 characters).\n\nOr type *back* to go back.", ""
 		}
 		session.DeliveryAddress = message
 		session.State = "CONFIRM"
-		return buildOrderSummary(session)
+		return buildOrderSummary(session), ""
 
 	case "PICKUP":
 		slot := 0
 		fmt.Sscanf(messageLower, "%d", &slot)
 		if slot < 1 || slot > len(pickupSlots) {
-			return "Please choose a valid slot number.\n\nOr type *back* to go back."
+			return "Please choose a valid slot number.\n\nOr type *back* to go back.", ""
 		}
 		session.Pickup = pickupSlots[slot-1]
 		session.State = "CONFIRM"
-		return buildOrderSummary(session)
+		return buildOrderSummary(session), ""
 
 	case "CONFIRM":
 		if messageLower == "yes" || messageLower == "confirm" {
@@ -891,7 +889,7 @@ func handleMessage(from, message string) string {
 			orderID, err := saveOrder(from, session, total)
 			if err != nil {
 				log.Printf("Error saving order: %v", err)
-				return "Sorry, there was an error processing your order. Please try again."
+				return "Sorry, there was an error processing your order. Please try again.", ""
 			}
 			session.PendingOrderID = orderID
 			session.State = "AWAITING_PAYMENT"
@@ -899,29 +897,29 @@ func handleMessage(from, message string) string {
 			paymentLink, err := createPaystackPaymentLink(orderID, from, totalKobo)
 			if err != nil {
 				log.Printf("Error creating payment link: %v", err)
-				return "Sorry, there was an error generating your payment link. Please try again."
+				return "Sorry, there was an error generating your payment link. Please try again.", ""
 			}
 			return fmt.Sprintf(
 				"💳 *Almost there!*\n\nYour order *#%s* is reserved.\n\n*Please complete payment to confirm:*\n\n%s\n\n⏰ Payment link expires in 30 minutes.\n\nOnce payment is confirmed, you'll receive a confirmation message automatically.",
 				orderID, paymentLink,
-			)
+			), ""
 		} else if messageLower == "no" || messageLower == "cancel" {
 			delete(sessions, from)
-			return "Order cancelled. Send *hi* to start again."
+			return "Order cancelled. Send *hi* to start again.", ""
 		}
-		return "Please reply *yes* to proceed to payment, *no* to cancel, or *back* to make changes."
+		return "Please reply *yes* to proceed to payment, *no* to cancel, or *back* to make changes.", ""
 
 	case "AWAITING_PAYMENT":
 		return fmt.Sprintf(
 			"⏳ *Waiting for payment...*\n\nYour order *#%s* is reserved pending payment.\n\nPlease complete payment using the link we sent you.\n\nOnce paid, you'll receive a confirmation automatically.\n\nType *track %s* to check your order status.",
 			session.PendingOrderID, session.PendingOrderID,
-		)
+		), ""
 
 	case "DONE":
-		return "Your order has been placed! Send *hi* to place a new order or type *orders* to see your order history."
+		return "Your order has been placed! Send *hi* to place a new order or type *orders* to see your order history.", ""
 	}
 
-	return "Send *hi* to start ordering."
+	return "Send *hi* to start ordering.", ""
 }
 
 // --- Message builders ---
@@ -1050,8 +1048,14 @@ func twilioWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	from := strings.TrimPrefix(r.FormValue("From"), "whatsapp:")
 	body := r.FormValue("Body")
 	log.Printf("[Twilio] Message from %s: %s", from, body)
-	reply := handleMessage(from, body)
-	if err := sendWhatsAppMessage(from, reply); err != nil {
+	reply, imageURL := handleMessage(from, body)
+	var err error
+	if imageURL != "" {
+		err = sendWhatsAppImage(from, imageURL, reply)
+	} else {
+		err = sendWhatsAppMessage(from, reply)
+	}
+	if err != nil {
 		log.Printf("Error sending message: %v", err)
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1114,8 +1118,14 @@ func metaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 						from := msg.From
 						text := msg.Text.Body
 						log.Printf("[Meta] Message from %s: %s", from, text)
-						reply := handleMessage(from, text)
-						if err := sendWhatsAppMessage(from, reply); err != nil {
+						reply, imageURL := handleMessage(from, text)
+						var err error
+						if imageURL != "" {
+							err = sendWhatsAppImage(from, imageURL, reply)
+						} else {
+							err = sendWhatsAppMessage(from, reply)
+						}
+						if err != nil {
 							log.Printf("Error sending Meta message: %v", err)
 						}
 					}
