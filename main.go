@@ -1711,55 +1711,89 @@ func adminCategoriesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type CategorySummary struct {
-		Name         string
-		ProductCount int
-		VisibleCount int
-	}
-
-	rows, err := db.Query(`
-		SELECT category, COUNT(*), COUNT(*) FILTER (WHERE available = true)
-		FROM products
-		GROUP BY category
-		ORDER BY category`)
-	if err != nil {
-		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	var categories []CategorySummary
-	for rows.Next() {
-		var c CategorySummary
-		rows.Scan(&c.Name, &c.ProductCount, &c.VisibleCount)
-		categories = append(categories, c)
-	}
-
 	w.Header().Set("Content-Type", "text/html")
 	adminHeader(w, "categories")
 
-	fmt.Fprintf(w, `<div class="card"><h2>Categories (%d)</h2>`, len(categories))
-	fmt.Fprintf(w, `<p style="color:#888;font-size:13px;margin-bottom:16px">Categories are created automatically when you add a product with a new category name on the Products page. Rename a category here to update it across all its products.</p>`)
+	categoryNames, _ := func() ([]string, error) {
+		rows, err := db.Query(`SELECT DISTINCT category FROM products ORDER BY category`)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var names []string
+		for rows.Next() {
+			var n string
+			rows.Scan(&n)
+			names = append(names, n)
+		}
+		return names, nil
+	}()
 
-	if len(categories) == 0 {
-		fmt.Fprintf(w, `<div class="empty">No categories yet. Add a product with a category on the Products page.</div></div>`)
-	} else {
-		fmt.Fprintf(w, `<div class="table-wrap"><table class="data-table"><tr><th>Category</th><th>Total Products</th><th>Visible</th><th>Rename</th></tr>`)
-		for _, c := range categories {
+	fmt.Fprintf(w, `<div class="card"><h2>Categories (%d)</h2>`, len(categoryNames))
+	fmt.Fprintf(w, `<p style="color:#888;font-size:13px">Categories are created automatically when you add a product with a new category name on the Products page. Rename a category below to update it across all its products.</p></div>`)
+
+	if len(categoryNames) == 0 {
+		fmt.Fprintf(w, `<div class="card"><div class="empty">No categories yet. Add a product with a category on the Products page.</div></div>`)
+	}
+
+	for _, catName := range categoryNames {
+		var total, visible int
+		db.QueryRow(`SELECT COUNT(*), COUNT(*) FILTER (WHERE available = true) FROM products WHERE category = $1`, catName).Scan(&total, &visible)
+
+		products, _ := func() ([]Product, error) {
+			rows, err := db.Query(`SELECT id, name, price, category, available, image_url FROM products WHERE category = $1 ORDER BY id`, catName)
+			if err != nil {
+				return nil, err
+			}
+			defer rows.Close()
+			var ps []Product
+			for rows.Next() {
+				var p Product
+				rows.Scan(&p.ID, &p.Name, &p.Price, &p.Category, &p.Available, &p.ImageURL)
+				ps = append(ps, p)
+			}
+			return ps, nil
+		}()
+
+		fmt.Fprintf(w, `
+		<div class="card">
+			<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px">
+				<div>
+					<span class="cat-pill" style="font-size:13px">%s</span>
+					<span style="color:#888;font-size:12px;margin-left:8px">%d products · %d visible</span>
+				</div>
+				<form method="POST" action="/admin/categories" style="display:flex;gap:6px">
+					<input type="hidden" name="action" value="rename_category">
+					<input type="hidden" name="old_name" value="%s">
+					<input type="text" name="new_name" placeholder="Rename category" style="width:160px;padding:7px;font-size:12px">
+					<button type="submit" class="btn btn-blue btn-sm">Rename</button>
+				</form>
+			</div>`, catName, total, visible, catName)
+
+		if len(products) == 0 {
+			fmt.Fprintf(w, `<div class="empty">No products in this category.</div></div>`)
+			continue
+		}
+
+		fmt.Fprintf(w, `<div class="table-wrap"><table class="data-table"><tr><th>Image</th><th>Product Name</th><th>Price (NGN)</th><th>Status</th></tr>`)
+		for _, p := range products {
+			rowClass := ""
+			statusPill := `<span class="status-pill status-ready">Visible</span>`
+			if !p.Available {
+				rowClass = "unavailable-row"
+				statusPill = `<span class="status-pill status-pending">Hidden</span>`
+			}
+			imageCell := `<span style="color:#bbb;font-size:11px">No image</span>`
+			if p.ImageURL != "" {
+				imageCell = fmt.Sprintf(`<img src="%s" style="width:36px;height:36px;object-fit:cover;border-radius:6px">`, p.ImageURL)
+			}
 			fmt.Fprintf(w, `
-			<tr>
-				<td><span class="cat-pill">%s</span></td>
-				<td>%d</td>
-				<td>%d</td>
-				<td>
-					<form method="POST" action="/admin/categories" style="display:flex;gap:6px">
-						<input type="hidden" name="action" value="rename_category">
-						<input type="hidden" name="old_name" value="%s">
-						<input type="text" name="new_name" placeholder="New name" style="width:140px;padding:6px;font-size:12px">
-						<button type="submit" class="btn btn-blue btn-sm">Rename</button>
-					</form>
-				</td>
-			</tr>`, c.Name, c.ProductCount, c.VisibleCount, c.Name)
+			<tr class="%s">
+				<td>%s</td>
+				<td class="prod-name">%s</td>
+				<td>NGN %.0f</td>
+				<td>%s</td>
+			</tr>`, rowClass, imageCell, p.Name, p.Price, statusPill)
 		}
 		fmt.Fprintf(w, `</table></div></div>`)
 	}
